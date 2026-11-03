@@ -372,7 +372,9 @@ def main() -> None:
                 print(
                     f"step={step} loss={metrics['loss/total'].item():.4f} "
                     f"audio={metrics['loss/audio'].item():.4f} "
-                    f"text={metrics['loss/text'].item():.4f} {rq_accuracy}",
+                    f"text={metrics['loss/text'].item():.4f} "
+                    f"text_np={metrics['text/non_pad_accuracy'].item():.3f} "
+                    f"{rq_accuracy}",
                     flush=True,
                 )
             if not args.smoke_test and step % args.save_every == 0:
@@ -395,7 +397,8 @@ def main() -> None:
                     for q in range(args.num_codebooks)
                 )
                 print(
-                    f"valid step={step} loss={valid_metrics['loss/total']:.4f} {valid_rq}",
+                    f"valid step={step} loss={valid_metrics['loss/total']:.4f} "
+                    f"text_np={valid_metrics['text/non_pad_accuracy']:.3f} {valid_rq}",
                     flush=True,
                 )
             if step >= target_steps:

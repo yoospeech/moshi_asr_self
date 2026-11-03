@@ -186,12 +186,22 @@ def masked_tts_loss(
     else:
         text_loss = text_losses.mean()
     total = audio_weight * audio_loss + text_weight * text_loss
+    text_predictions = text_logits.argmax(dim=-1)
+    non_pad_text_mask = (
+        valid_text_targets != text_padding_id
+        if text_padding_id is not None
+        else torch.ones_like(valid_text_targets, dtype=torch.bool)
+    )
+    non_pad_text_accuracy = (
+        (text_predictions[non_pad_text_mask] == valid_text_targets[non_pad_text_mask]).float().mean()
+        if non_pad_text_mask.any()
+        else text_logits.new_zeros(())
+    )
     metrics.update({
         "loss/total": total.detach(),
         "loss/audio": audio_loss.detach(),
         "loss/text": text_loss.detach(),
-        "text/accuracy": (
-            text_logits.argmax(dim=-1) == valid_text_targets
-        ).float().mean().detach(),
+        "text/accuracy": (text_predictions == valid_text_targets).float().mean().detach(),
+        "text/non_pad_accuracy": non_pad_text_accuracy.detach(),
     })
     return total, metrics

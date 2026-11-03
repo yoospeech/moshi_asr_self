@@ -85,3 +85,25 @@ tensorboard --logdir runs/assistant_tts/tensorboard --port 6006
 RQ-specific loss and masked top-1 accuracy, text metrics, validation metrics,
 and learning rates are logged to TensorBoard. More implementation details are
 in [TTS_TRAINING.md](TTS_TRAINING.md).
+
+## Offline batch inference
+
+`infer_tts.py` synthesizes one or more utterances without the streaming cache.
+It recomputes the full temporal prefix at every frame, samples RQ0 through RQ3,
+undoes the training delay pattern, and decodes the result with Mimi:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 infer_tts.py \
+  --checkpoint runs/assistant_tts_batch3/checkpoint_00002500.pt \
+  --config runs/assistant_tts_batch3/config.json \
+  --model models/SmolLM2-135M \
+  --mimi-device cuda:1 \
+  --text "오늘은 날씨가 정말 좋네요." \
+  --text "안녕하세요. 만나서 반갑습니다." \
+  --output-dir inference_outputs
+```
+
+Use `--text-file prompts.txt` to synthesize one non-empty line per utterance.
+Because raw text has no word timestamps, the offline path approximates the
+training PAD/EPAD timeline. `--frames-per-word` controls the assumed speaking
+rate, while `--tail-seconds` controls silence after the final word.
