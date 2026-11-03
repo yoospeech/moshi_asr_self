@@ -92,5 +92,5 @@ in [TTS_TRAINING.md](TTS_TRAINING.md).
 
 ## Inference
 
-See [INFERENCE.md](INFERENCE.md) for raw-text inference, exact time-aligned
+See [TTS_INFERENCE.md](TTS_INFERENCE.md) for raw-text inference, exact time-aligned
 training-sample inference, alignment extraction, and listening examples.
