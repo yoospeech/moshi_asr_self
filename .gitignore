@@ -1,0 +1,31 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+.env
+
+# Local model weights and downloaded checkpoints.
+models/
+*.safetensors
+*.ckpt
+*.pth
+
+# Training artifacts (checkpoints, optimizer state, TensorBoard logs).
+runs/
+outputs/
+logs/
+wandb/
+
+# Local datasets and generated token caches.
+data/
+*.wav
+*.flac
+*.mp3
+
+.DS_Store
+Thumbs.db

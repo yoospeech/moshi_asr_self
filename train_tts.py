@@ -1,0 +1,358 @@
+"""Train assistant-only DSM TTS with SmolLM2 temporal + Moshi Depformer."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader, random_split
+from transformers import AutoTokenizer
+
+from smollm_moshi_tts import SmolLM2MoshiTTS, TTSModelConfig, masked_tts_loss
+from tts_dataset import DailyTalkDataset, collate_dailytalk
+
+from moshi.models import loaders as moshi_loaders
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest")
+    parser.add_argument("--model", default="models/SmolLM2-135M")
+    parser.add_argument("--mimi-checkpoint")
+    parser.add_argument("--mimi-repo", default=moshi_loaders.DEFAULT_REPO)
+    parser.add_argument("--mimi-device", help="e.g. cuda:1; defaults to the training device")
+    parser.add_argument("--output", default="runs/assistant_tts")
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--grad-accum", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--temporal-learning-rate", type=float, default=2e-5)
+    parser.add_argument("--num-codebooks", type=int, default=4)
+    parser.add_argument("--audio-card", type=int, default=2048)
+    parser.add_argument("--depformer-dim", type=int, default=1024)
+    parser.add_argument("--depformer-heads", type=int, default=16)
+    parser.add_argument("--depformer-layers", type=int, default=6)
+    parser.add_argument("--depformer-ffn-dim", type=int, default=4096)
+    parser.add_argument("--context", type=int, default=3000)
+    parser.add_argument("--tts-audio-delay", type=float, default=2.0)
+    parser.add_argument("--acoustic-delay", type=int, default=2)
+    parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--tensorboard-dir")
+    parser.add_argument("--valid-ratio", type=float, default=0.05)
+    parser.add_argument("--valid-every", type=int, default=500)
+    parser.add_argument("--valid-batches", type=int, default=20)
+    parser.add_argument("--min-duration", type=float, default=5.0)
+    parser.add_argument("--max-duration", type=float, default=45.0)
+    parser.add_argument("--min-words", type=int, default=5)
+    parser.add_argument("--min-words-per-second", type=float, default=0.5)
+    parser.add_argument("--max-words-per-second", type=float, default=2.5)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--smoke-test", action="store_true")
+    return parser.parse_args()
+
+
+def save_checkpoint(model: SmolLM2MoshiTTS, optimizer: torch.optim.Optimizer, step: int, output: Path) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step},
+        output / f"checkpoint_{step:08d}.pt",
+    )
+    (output / "config.json").write_text(json.dumps(model.checkpoint_metadata(), indent=2), encoding="utf-8")
+
+
+@torch.no_grad()
+def online_streams(
+    batch: dict[str, object],
+    mimi: torch.nn.Module,
+    device: torch.device,
+    config: TTSModelConfig,
+) -> torch.Tensor:
+    """Extract frozen Mimi codes and combine them with aligned text."""
+    text_tokens = batch["text_tokens"].to(device, non_blocking=True)  # type: ignore[union-attr]
+    frame_lengths = batch["frame_lengths"].tolist()  # type: ignore[union-attr]
+    mimi_device = next(mimi.parameters()).device
+    waveforms = batch["waveforms"].to(mimi_device, non_blocking=True)  # type: ignore[union-attr]
+    audio_codes = mimi.encode(waveforms).to(device)
+    if audio_codes.shape[1] != config.num_codebooks:
+        raise RuntimeError(
+            f"Mimi returned {audio_codes.shape[1]} codebooks, expected {config.num_codebooks}"
+        )
+
+    tail = max(config.delays)
+    total_frames = max(audio_codes.shape[-1], max(frame_lengths)) + tail
+    streams = torch.full(
+        (audio_codes.shape[0], 1 + config.num_codebooks, total_frames),
+        -1,
+        dtype=torch.long,
+        device=device,
+    )
+    for index, expected_frames in enumerate(frame_lengths):
+        valid_frames = min(expected_frames, audio_codes.shape[-1])
+        streams[index, 0, :valid_frames] = text_tokens[index, :valid_frames]
+        streams[index, 0, valid_frames : valid_frames + tail] = config.text_padding_id
+        streams[index, 1:, :valid_frames] = audio_codes[index, :, :valid_frames]
+    return streams
+
+
+@torch.no_grad()
+def evaluate(
+    model: SmolLM2MoshiTTS,
+    loader: DataLoader,
+    device: torch.device,
+    dtype: torch.dtype,
+    text_padding_id: int,
+    max_batches: int,
+    mimi: torch.nn.Module,
+    config: TTSModelConfig,
+) -> dict[str, float]:
+    model.eval()
+    totals: dict[str, float] = {}
+    count = 0
+    for batch_index, batch in enumerate(loader):
+        if max_batches > 0 and batch_index >= max_batches:
+            break
+        streams = online_streams(batch, mimi, device, config)
+        autocast = (
+            torch.autocast(device_type="cuda", dtype=dtype)
+            if device.type == "cuda"
+            else contextlib.nullcontext()
+        )
+        with autocast:
+            output = model(streams)
+            _, metrics = masked_tts_loss(
+                output,
+                streams,
+                text_padding_id=text_padding_id,
+            )
+        for name, value in metrics.items():
+            totals[name] = totals.get(name, 0.0) + value.item()
+        count += 1
+    model.train()
+    if count == 0:
+        raise RuntimeError("validation loader produced no batches")
+    return {name: value / count for name, value in totals.items()}
+
+
+def main() -> None:
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    base_text_card = len(tokenizer)
+    # Reserve PAD and EPAD immediately after SmolLM2's native vocabulary.
+    config = TTSModelConfig(
+        temporal_model=args.model,
+        text_card=base_text_card + 2,
+        text_padding_id=base_text_card,
+        text_epad_id=base_text_card + 1,
+        audio_card=args.audio_card,
+        num_codebooks=args.num_codebooks,
+        depformer_dim=args.depformer_dim,
+        depformer_num_heads=args.depformer_heads,
+        depformer_num_layers=args.depformer_layers,
+        depformer_dim_feedforward=args.depformer_ffn_dim,
+        context=args.context,
+        tts_audio_delay_seconds=args.tts_audio_delay,
+        acoustic_delay_steps=args.acoustic_delay,
+    )
+    model = SmolLM2MoshiTTS(config, dtype=dtype, device=device)
+    model.train()
+
+    mimi = None
+    if not args.smoke_test:
+        mimi_checkpoint = args.mimi_checkpoint
+        if mimi_checkpoint is None:
+            mimi_checkpoint = str(moshi_loaders.hf_get(moshi_loaders.MIMI_NAME, args.mimi_repo))
+        mimi_device = torch.device(args.mimi_device) if args.mimi_device else device
+        mimi = moshi_loaders.get_mimi(
+            mimi_checkpoint,
+            device=mimi_device,
+            num_codebooks=config.num_codebooks,
+        )
+        mimi.eval()
+        for parameter in mimi.parameters():
+            parameter.requires_grad_(False)
+
+    tensorboard_dir = Path(args.tensorboard_dir or Path(args.output) / "tensorboard")
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as error:
+        raise SystemExit(
+            "TensorBoard logging requires the 'tensorboard' package: pip install tensorboard"
+        ) from error
+    writer = SummaryWriter(log_dir=str(tensorboard_dir))
+
+    temporal_parameters = list(model.transformer.parameters())
+    temporal_ids = {id(parameter) for parameter in temporal_parameters}
+    new_parameters = [parameter for parameter in model.parameters() if id(parameter) not in temporal_ids]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": temporal_parameters, "lr": args.temporal_learning_rate},
+            {"params": new_parameters, "lr": args.learning_rate},
+        ],
+        betas=(0.9, 0.95),
+        weight_decay=0.1,
+    )
+
+    if args.smoke_test:
+        # Valid DSM controls plus random Mimi codes. This checks the complete
+        # Temporal -> Depformer -> loss -> backward path without a dataset.
+        smoke_frames = max(64, config.delays[-1] + 8)
+        text = torch.randint(0, 100, (1, smoke_frames), device=device)
+        audio = torch.randint(
+            0, args.audio_card, (1, args.num_codebooks, smoke_frames), device=device
+        )
+        streams = torch.cat([text[:, None], audio], dim=1)
+        batches = [{"streams": streams}]
+        valid_loader = None
+        target_steps = 1
+    else:
+        if args.manifest is None:
+            raise SystemExit("--manifest is required unless --smoke-test is used")
+        dataset = DailyTalkDataset(
+            args.manifest,
+            tokenizer,
+            sample_rate=24000,
+            frame_rate=config.frame_rate,
+            text_padding_id=config.text_padding_id,
+            text_epad_id=config.text_epad_id,
+            min_duration=args.min_duration,
+            max_duration=args.max_duration,
+            min_words=args.min_words,
+            min_words_per_second=args.min_words_per_second,
+            max_words_per_second=args.max_words_per_second,
+        )
+        print(
+            f"dataset filter: original={dataset.original_size} kept={len(dataset)} "
+            f"hours={dataset.filtered_hours:.2f} rejected={dataset.rejected}"
+        )
+        if not 0.0 < args.valid_ratio < 1.0:
+            raise SystemExit("--valid-ratio must be between 0 and 1")
+        valid_size = max(1, round(len(dataset) * args.valid_ratio))
+        train_size = len(dataset) - valid_size
+        if train_size < 1:
+            raise SystemExit("validation split leaves no training samples")
+        split_generator = torch.Generator().manual_seed(args.seed)
+        train_dataset, valid_dataset = random_split(
+            dataset,
+            [train_size, valid_size],
+            generator=split_generator,
+        )
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "split.json").write_text(
+            json.dumps(
+                {
+                    "seed": args.seed,
+                    "valid_ratio": args.valid_ratio,
+                    "train_indices": train_dataset.indices,
+                    "valid_indices": valid_dataset.indices,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_dailytalk,
+        )
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=2,
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_dailytalk,
+        )
+        print(f"dataset split: train={train_size} valid={valid_size} seed={args.seed}")
+        batches = loader
+        target_steps = args.steps
+
+    optimizer.zero_grad(set_to_none=True)
+    step = 0
+    while step < target_steps:
+        for batch in batches:
+            if args.smoke_test:
+                streams = batch["streams"].to(device, non_blocking=True)
+            else:
+                assert mimi is not None
+                streams = online_streams(batch, mimi, device, config)
+            autocast = (
+                torch.autocast(device_type="cuda", dtype=dtype)
+                if device.type == "cuda"
+                else contextlib.nullcontext()
+            )
+            with autocast:
+                output = model(streams)
+                loss, metrics = masked_tts_loss(
+                    output,
+                    streams,
+                    text_padding_id=config.text_padding_id,
+                )
+                scaled_loss = loss / args.grad_accum
+            scaled_loss.backward()
+
+            if (step + 1) % args.grad_accum == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            step += 1
+            if step % args.log_every == 0 or step == 1:
+                for name, value in metrics.items():
+                    writer.add_scalar(name, value.item(), step)
+                writer.add_scalar("optimizer/temporal_lr", optimizer.param_groups[0]["lr"], step)
+                writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
+                rq_accuracy = " ".join(
+                    f"rq{q}={metrics[f'rq/{q}_accuracy'].item():.3f}"
+                    for q in range(args.num_codebooks)
+                )
+                print(
+                    f"step={step} loss={metrics['loss/total'].item():.4f} "
+                    f"audio={metrics['loss/audio'].item():.4f} "
+                    f"text={metrics['loss/text'].item():.4f} {rq_accuracy}",
+                    flush=True,
+                )
+            if not args.smoke_test and step % args.save_every == 0:
+                save_checkpoint(model, optimizer, step, Path(args.output))
+            if valid_loader is not None and step % args.valid_every == 0:
+                valid_metrics = evaluate(
+                    model,
+                    valid_loader,
+                    device,
+                    dtype,
+                    config.text_padding_id,
+                    args.valid_batches,
+                    mimi,
+                    config,
+                )
+                for name, value in valid_metrics.items():
+                    writer.add_scalar(f"valid/{name}", value, step)
+                valid_rq = " ".join(
+                    f"rq{q}={valid_metrics[f'rq/{q}_accuracy']:.3f}"
+                    for q in range(args.num_codebooks)
+                )
+                print(
+                    f"valid step={step} loss={valid_metrics['loss/total']:.4f} {valid_rq}",
+                    flush=True,
+                )
+            if step >= target_steps:
+                break
+
+    if not args.smoke_test:
+        save_checkpoint(model, optimizer, step, Path(args.output))
+    writer.flush()
+    writer.close()
+
+
+if __name__ == "__main__":
+    main()

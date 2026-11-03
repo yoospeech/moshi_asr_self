@@ -1,0 +1,3 @@
+[submodule "thirdparty/moshi"]
+	path = thirdparty/moshi
+	url = https://github.com/kyutai-labs/moshi.git
