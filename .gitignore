@@ -27,5 +27,9 @@ data/
 *.flac
 *.mp3
 
+# Small listening examples intentionally committed with the source.
+!samples/
+!samples/*.wav
+
 .DS_Store
 Thumbs.db
