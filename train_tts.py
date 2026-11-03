@@ -52,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-words-per-second", type=float, default=2.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--print-model", action="store_true", help="print the full PyTorch module tree")
     return parser.parse_args()
 
 
@@ -62,6 +63,56 @@ def save_checkpoint(model: SmolLM2MoshiTTS, optimizer: torch.optim.Optimizer, st
         output / f"checkpoint_{step:08d}.pt",
     )
     (output / "config.json").write_text(json.dumps(model.checkpoint_metadata(), indent=2), encoding="utf-8")
+
+
+def print_model_summary(
+    model: SmolLM2MoshiTTS,
+    config: TTSModelConfig,
+    mimi: torch.nn.Module | None,
+    *,
+    full: bool = False,
+) -> None:
+    groups = {"temporal": 0, "depformer": 0, "streams_and_heads": 0}
+    depformer_prefixes = (
+        "depformer.", "depformer_in.", "depformer_emb.",
+        "depformer_text_emb.", "depformer_norms.", "linears.",
+    )
+    for name, parameter in model.named_parameters():
+        if name.startswith("transformer."):
+            groups["temporal"] += parameter.numel()
+        elif name.startswith(depformer_prefixes):
+            groups["depformer"] += parameter.numel()
+        else:
+            groups["streams_and_heads"] += parameter.numel()
+
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    parameter_bytes = sum(parameter.numel() * parameter.element_size() for parameter in model.parameters())
+    print("model structure:")
+    print(f"  temporal: SmolLM2 hidden={model.dim} context={config.context}")
+    print(
+        f"  depformer: dim={config.depformer_dim} heads={config.depformer_num_heads} "
+        f"layers={config.depformer_num_layers} ffn={config.depformer_dim_feedforward}"
+    )
+    print(
+        f"  streams: text=1 audio={config.num_codebooks} card={config.audio_card} "
+        f"delays={config.delays}"
+    )
+    for name, count in groups.items():
+        print(f"  parameters/{name}: {count / 1e6:.2f}M")
+    print(f"  parameters/total: {total / 1e6:.2f}M (trainable {trainable / 1e6:.2f}M)")
+    print(f"  parameter storage: {parameter_bytes / 2**20:.1f} MiB ({model.dtype})")
+    if mimi is not None:
+        mimi_total = sum(parameter.numel() for parameter in mimi.parameters())
+        mimi_bytes = sum(parameter.numel() * parameter.element_size() for parameter in mimi.parameters())
+        mimi_device = next(mimi.parameters()).device
+        print(
+            f"  mimi/frozen: {mimi_total / 1e6:.2f}M, "
+            f"{mimi_bytes / 2**20:.1f} MiB, device={mimi_device}"
+        )
+    if full:
+        print("full model:")
+        print(model)
 
 
 @torch.no_grad()
@@ -178,6 +229,8 @@ def main() -> None:
         mimi.eval()
         for parameter in mimi.parameters():
             parameter.requires_grad_(False)
+
+    print_model_summary(model, config, mimi, full=args.print_model)
 
     tensorboard_dir = Path(args.tensorboard_dir or Path(args.output) / "tensorboard")
     try:
