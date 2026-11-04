@@ -24,7 +24,7 @@ from moshi.models.lm import LMModel, LMOutput  # noqa: E402
 
 
 @dataclass
-class TTSModelConfig:
+class STTContinuationConfig:
     temporal_model: str = "models/SmolLM2-135M"
     text_card: int = 49154
     audio_card: int = 2048
@@ -35,36 +35,40 @@ class TTSModelConfig:
     depformer_dim_feedforward: int = 4096
     context: int = 3000
     frame_rate: float = 12.5
-    tts_audio_delay_seconds: float = 2.0
+    text_delay_seconds: float = 2.0
     acoustic_delay_steps: int = 2
     text_padding_id: int = 49152
     text_epad_id: int = 49153
+    user_begin_id: int = 49154
+    user_end_id: int = 49155
+    assistant_begin_id: int = 49156
+    assistant_end_id: int = 49157
 
     @property
-    def tts_audio_delay_steps(self) -> int:
-        return int(round(self.tts_audio_delay_seconds * self.frame_rate))
+    def text_delay_steps(self) -> int:
+        return int(round(self.text_delay_seconds * self.frame_rate))
 
     @property
     def delays(self) -> list[int]:
-        # Paper TTS setup: audio is 2 seconds behind text, then acoustic
-        # codebooks are delayed by tau relative to the semantic codebook.
-        audio = self.tts_audio_delay_steps
-        return [0, audio] + [audio + self.acoustic_delay_steps] * (self.num_codebooks - 1)
+        # User semantic audio leads text; acoustic codebooks trail semantic audio.
+        return [self.text_delay_steps, 0] + [self.acoustic_delay_steps] * (
+            self.num_codebooks - 1
+        )
 
 
-class SmolLM2MoshiTTS(LMModel):
-    """Assistant-only DSM model: SmolLM2 temporal model + Moshi Depformer."""
+class SmolLM2MoshiSTTContinuation(LMModel):
+    """User-only delayed-stream STT-continuation model."""
 
     def __init__(
         self,
-        config: TTSModelConfig,
+        config: STTContinuationConfig,
         *,
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         temporal_config = AutoConfig.from_pretrained(config.temporal_model)
         dim = int(temporal_config.hidden_size)
-        self.tts_config = config
+        self.stt_continuation_config = config
 
         # LMModel creates the exact Moshi embeddings, delay logic and
         # Depformer. Its temporal transformer is replaced immediately below.
@@ -139,10 +143,10 @@ class SmolLM2MoshiTTS(LMModel):
         return temporal_hidden, self.text_linear(temporal_hidden)[:, None]
 
     def checkpoint_metadata(self) -> dict[str, object]:
-        return asdict(self.tts_config)
+        return asdict(self.stt_continuation_config)
 
 
-def masked_tts_loss(
+def masked_stt_continuation_loss(
     output: LMOutput,
     streams: torch.Tensor,
     *,

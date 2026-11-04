@@ -1,4 +1,4 @@
-"""Train assistant-only DSM TTS with SmolLM2 temporal + Moshi Depformer."""
+"""Train user-only delayed-stream STT continuation with SmolLM2 + Moshi."""
 
 from __future__ import annotations
 
@@ -11,8 +11,12 @@ import torch
 from torch.utils.data import DataLoader, random_split
 from transformers import AutoTokenizer
 
-from smollm_moshi_tts import SmolLM2MoshiTTS, TTSModelConfig, masked_tts_loss
-from tts_dataset import DailyTalkDataset, collate_dailytalk
+from smollm_moshi_stt_continuation import (
+    STTContinuationConfig,
+    SmolLM2MoshiSTTContinuation,
+    masked_stt_continuation_loss,
+)
+from stt_continuation_dataset import DailyTalkDataset, collate_dailytalk
 
 from moshi.models import loaders as moshi_loaders
 
@@ -24,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mimi-checkpoint")
     parser.add_argument("--mimi-repo", default=moshi_loaders.DEFAULT_REPO)
     parser.add_argument("--mimi-device", help="e.g. cuda:1; defaults to the training device")
-    parser.add_argument("--output", default="runs/assistant_tts")
+    parser.add_argument("--output", default="runs/stt_continuation")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1000)
@@ -37,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depformer-layers", type=int, default=6)
     parser.add_argument("--depformer-ffn-dim", type=int, default=4096)
     parser.add_argument("--context", type=int, default=3000)
-    parser.add_argument("--tts-audio-delay", type=float, default=2.0)
+    parser.add_argument("--text-delay", type=float, default=2.0)
     parser.add_argument("--acoustic-delay", type=int, default=2)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
@@ -56,7 +60,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def save_checkpoint(model: SmolLM2MoshiTTS, optimizer: torch.optim.Optimizer, step: int, output: Path) -> None:
+def save_checkpoint(model: SmolLM2MoshiSTTContinuation, optimizer: torch.optim.Optimizer, step: int, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     torch.save(
         {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "step": step},
@@ -66,8 +70,8 @@ def save_checkpoint(model: SmolLM2MoshiTTS, optimizer: torch.optim.Optimizer, st
 
 
 def print_model_summary(
-    model: SmolLM2MoshiTTS,
-    config: TTSModelConfig,
+    model: SmolLM2MoshiSTTContinuation,
+    config: STTContinuationConfig,
     mimi: torch.nn.Module | None,
     *,
     full: bool = False,
@@ -120,11 +124,12 @@ def online_streams(
     batch: dict[str, object],
     mimi: torch.nn.Module,
     device: torch.device,
-    config: TTSModelConfig,
+    config: STTContinuationConfig,
 ) -> torch.Tensor:
     """Extract frozen Mimi codes and combine them with aligned text."""
     text_tokens = batch["text_tokens"].to(device, non_blocking=True)  # type: ignore[union-attr]
-    frame_lengths = batch["frame_lengths"].tolist()  # type: ignore[union-attr]
+    audio_frame_lengths = batch["audio_frame_lengths"].tolist()  # type: ignore[union-attr]
+    text_frame_lengths = batch["text_frame_lengths"].tolist()  # type: ignore[union-attr]
     mimi_device = next(mimi.parameters()).device
     waveforms = batch["waveforms"].to(mimi_device, non_blocking=True)  # type: ignore[union-attr]
     audio_codes = mimi.encode(waveforms).to(device)
@@ -134,31 +139,33 @@ def online_streams(
         )
 
     tail = max(config.delays)
-    total_frames = max(audio_codes.shape[-1], max(frame_lengths)) + tail
+    total_frames = max(audio_codes.shape[-1], max(text_frame_lengths)) + tail
     streams = torch.full(
         (audio_codes.shape[0], 1 + config.num_codebooks, total_frames),
         -1,
         dtype=torch.long,
         device=device,
     )
-    for index, expected_frames in enumerate(frame_lengths):
-        valid_frames = min(expected_frames, audio_codes.shape[-1])
-        streams[index, 0, :valid_frames] = text_tokens[index, :valid_frames]
-        streams[index, 0, valid_frames : valid_frames + tail] = config.text_padding_id
-        streams[index, 1:, :valid_frames] = audio_codes[index, :, :valid_frames]
+    for index, (audio_frames, text_frames) in enumerate(
+        zip(audio_frame_lengths, text_frame_lengths, strict=True)
+    ):
+        valid_audio_frames = min(audio_frames, audio_codes.shape[-1])
+        streams[index, 0, :text_frames] = text_tokens[index, :text_frames]
+        streams[index, 0, text_frames : text_frames + tail] = config.text_padding_id
+        streams[index, 1:, :valid_audio_frames] = audio_codes[index, :, :valid_audio_frames]
     return streams
 
 
 @torch.no_grad()
 def evaluate(
-    model: SmolLM2MoshiTTS,
+    model: SmolLM2MoshiSTTContinuation,
     loader: DataLoader,
     device: torch.device,
     dtype: torch.dtype,
     text_padding_id: int,
     max_batches: int,
     mimi: torch.nn.Module,
-    config: TTSModelConfig,
+    config: STTContinuationConfig,
 ) -> dict[str, float]:
     model.eval()
     totals: dict[str, float] = {}
@@ -174,7 +181,7 @@ def evaluate(
         )
         with autocast:
             output = model(streams)
-            _, metrics = masked_tts_loss(
+            _, metrics = masked_stt_continuation_loss(
                 output,
                 streams,
                 text_padding_id=text_padding_id,
@@ -196,12 +203,16 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     base_text_card = len(tokenizer)
-    # Reserve PAD and EPAD immediately after SmolLM2's native vocabulary.
-    config = TTSModelConfig(
+    # Keep Moshi PAD/EPAD and reserve four shared-channel boundary tokens.
+    config = STTContinuationConfig(
         temporal_model=args.model,
-        text_card=base_text_card + 2,
+        text_card=base_text_card + 6,
         text_padding_id=base_text_card,
         text_epad_id=base_text_card + 1,
+        user_begin_id=base_text_card + 2,
+        user_end_id=base_text_card + 3,
+        assistant_begin_id=base_text_card + 4,
+        assistant_end_id=base_text_card + 5,
         audio_card=args.audio_card,
         num_codebooks=args.num_codebooks,
         depformer_dim=args.depformer_dim,
@@ -209,10 +220,10 @@ def main() -> None:
         depformer_num_layers=args.depformer_layers,
         depformer_dim_feedforward=args.depformer_ffn_dim,
         context=args.context,
-        tts_audio_delay_seconds=args.tts_audio_delay,
+        text_delay_seconds=args.text_delay,
         acoustic_delay_steps=args.acoustic_delay,
     )
-    model = SmolLM2MoshiTTS(config, dtype=dtype, device=device)
+    model = SmolLM2MoshiSTTContinuation(config, dtype=dtype, device=device)
     model.train()
 
     mimi = None
@@ -256,7 +267,7 @@ def main() -> None:
     if args.smoke_test:
         # Valid DSM controls plus random Mimi codes. This checks the complete
         # Temporal -> Depformer -> loss -> backward path without a dataset.
-        smoke_frames = max(64, config.delays[-1] + 8)
+        smoke_frames = max(64, max(config.delays) + 8)
         text = torch.randint(0, 100, (1, smoke_frames), device=device)
         audio = torch.randint(
             0, args.audio_card, (1, args.num_codebooks, smoke_frames), device=device
@@ -275,6 +286,10 @@ def main() -> None:
             frame_rate=config.frame_rate,
             text_padding_id=config.text_padding_id,
             text_epad_id=config.text_epad_id,
+            user_begin_id=config.user_begin_id,
+            user_end_id=config.user_end_id,
+            assistant_begin_id=config.assistant_begin_id,
+            assistant_end_id=config.assistant_end_id,
             min_duration=args.min_duration,
             max_duration=args.max_duration,
             min_words=args.min_words,
@@ -347,7 +362,7 @@ def main() -> None:
             )
             with autocast:
                 output = model(streams)
-                loss, metrics = masked_tts_loss(
+                loss, metrics = masked_stt_continuation_loss(
                     output,
                     streams,
                     text_padding_id=config.text_padding_id,
