@@ -54,18 +54,20 @@ The trainer reads the DailyTalkContiguous manifest and adjacent word-alignment
 JSON files. The selected user waveform is resampled to 24 kHz, and frozen Mimi
 extracts four audio codebooks online.
 
-Generate `user_hyp` text and word timestamps with faster-whisper Turbo:
+Generate `user_hyp` text and word timestamps with whisper-timestamped Medium:
 
 ```bash
 python3 scripts/transcribe_user_hyp.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.jsonl \
   --output /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --user-channel 1 \
-  --model turbo \
-  --device cuda \
-  --device-index 0 \
-  --compute-type float16
+  --model medium \
+  --device auto
 ```
+
+Audio longer than 10 seconds uses Auditok VAD by default. Pass `--no-vad` to
+disable it. Word alignment is provided by whisper-timestamped and does not use
+OpenAI Whisper's Triton word-timestamp kernel.
 
 The input manifest is never overwritten. Per-item cache files allow an
 interrupted run to resume without transcribing completed audio again.

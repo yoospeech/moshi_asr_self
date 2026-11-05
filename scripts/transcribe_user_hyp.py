@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Attach faster-whisper user transcripts and word timestamps to a JSONL manifest."""
+"""Attach whisper-timestamped transcripts and word timestamps to a manifest."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from typing import Any
 
 import numpy as np
 import sphn
-from faster_whisper import WhisperModel
+import torch
+import whisper_timestamped as whisper
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,10 +31,11 @@ def parse_args() -> argparse.Namespace:
         "--output", type=Path,
         help="output JSONL; defaults to MANIFEST.with_suffix('.user_hyp.jsonl')",
     )
-    parser.add_argument("--model", default="turbo")
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--device-index", type=int, default=0)
-    parser.add_argument("--compute-type", default="float16")
+    parser.add_argument("--model", default="medium")
+    parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto",
+        help="inference device; auto uses CUDA when available (default: auto)",
+    )
     parser.add_argument("--language", default="en")
     parser.add_argument("--beam-size", type=int, default=5)
     parser.add_argument("--no-vad", action="store_true")
@@ -71,46 +73,57 @@ def atomic_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def transcribe(
-    model: WhisperModel,
+    model: Any,
     audio: np.ndarray,
     *,
     language: str | None,
     beam_size: int,
-    vad_filter: bool,
+    vad: bool,
 ) -> dict[str, Any]:
-    segments_iterator, info = model.transcribe(
+    duration = audio.shape[-1] / 16_000
+    result = whisper.transcribe(
+        model,
         audio, task="transcribe", language=language,
-        beam_size=beam_size, word_timestamps=True, vad_filter=vad_filter,
+        vad="auditok" if vad and duration > 10 else False,
+        best_of=5, beam_size=beam_size,
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         condition_on_previous_text=False,
+        fp16=model.device.type == "cuda", verbose=None,
     )
     segments: list[dict[str, Any]] = []
     words: list[dict[str, Any]] = []
     text_parts = []
-    for segment in segments_iterator:
+    for segment in result.get("segments", []):
         segment_words = []
-        for word in segment.words or []:
+        for word in segment.get("words", []):
             item = {
-                "word": word.word.strip(),
-                "start": round(float(word.start), 3),
-                "end": round(float(word.end), 3),
-                "probability": round(float(word.probability), 6),
+                "word": word["text"].strip(),
+                "start": round(float(word["start"]), 3),
+                "end": round(float(word["end"]), 3),
+                "probability": round(float(word.get("confidence", 0.0)), 6),
             }
             if item["word"]:
                 segment_words.append(item)
                 words.append(item)
-        segment_text = segment.text.strip()
+        segment_text = segment.get("text", "").strip()
         if segment_text:
             text_parts.append(segment_text)
         segments.append({
-            "start": round(float(segment.start), 3),
-            "end": round(float(segment.end), 3),
+            "start": round(float(segment["start"]), 3),
+            "end": round(float(segment["end"]), 3),
             "text": segment_text,
             "words": segment_words,
         })
+    language_probability = result.get("language_probs", {}).get(
+        result.get("language", language)
+    )
     return {
         "text": " ".join(text_parts).strip(),
-        "language": info.language,
-        "language_probability": round(float(info.language_probability), 6),
+        "language": result.get("language", language),
+        "language_probability": (
+            round(float(language_probability), 6)
+            if language_probability is not None else None
+        ),
         "words": words,
         "segments": segments,
     }
@@ -159,10 +172,11 @@ def main() -> None:
         preview = ", ".join(map(str, missing_rows[:10]))
         raise SystemExit(f"missing user WAV for {len(missing_rows)} rows; first: {preview}")
 
-    model = WhisperModel(
-        args.model, device=args.device, device_index=args.device_index,
-        compute_type=args.compute_type,
-    )
+    device = args.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"loading whisper-timestamped model={args.model} device={device}", flush=True)
+    model = whisper.load_model(args.model, device=device)
     for position, (row_number, audio_path) in enumerate(candidates, start=1):
         cache_path = cache_dir / f"row_{row_number:06d}.json"
         if cache_path.exists() and not args.overwrite_cache:
@@ -184,7 +198,7 @@ def main() -> None:
         )
         hypothesis = transcribe(
             model, user_audio, language=args.language or None,
-            beam_size=args.beam_size, vad_filter=not args.no_vad,
+            beam_size=args.beam_size, vad=not args.no_vad,
         )
         atomic_json(cache_path, {
             "manifest_row": row_number,
