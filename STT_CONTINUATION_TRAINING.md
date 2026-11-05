@@ -2,11 +2,11 @@
 
 The training path is:
 
-`aligned text + user Mimi streams -> SmolLM2 Temporal Transformer -> Moshi Depformer`
+`aligned text + user Mimi streams -> SmolLM2 Temporal Transformer -> text logits`
 
-The Moshi Depth Transformer, delayed-stream transformation, masks, and
-teacher-forcing path come from `thirdparty/moshi/moshi/moshi/models/lm.py`.
-Only the Temporal Transformer is replaced with the local SmolLM2 checkpoint.
+Moshi's delayed-stream transformation and masks are retained, while the audio
+Depformer and audio-token prediction objective are disabled. The Temporal
+Transformer is replaced with the local SmolLM2 checkpoint.
 
 ## Delay pattern
 
@@ -27,8 +27,9 @@ semantic audio. Acoustic streams are delayed by two frames relative to the
 semantic stream. The online stream builder appends enough text PAD frames to
 preserve the delayed text targets at the end of each item.
 
-The joint objective is retained: text CE plus semantic-weighted audio CE. At
-inference, user Mimi tokens are forced and only text is sampled.
+The objective is text CE only. Mimi audio tokens are conditioning inputs, not
+prediction targets. At inference, user Mimi tokens are forced and only text is
+sampled.
 
 ## Validation and training
 
@@ -53,8 +54,8 @@ CUDA_VISIBLE_DEVICES=0,1 python3 train_stt_continuation.py \
   --output runs/stt_continuation
 ```
 
-TensorBoard logs include masked accuracy and CE loss for each RQ level, text
-accuracy, validation metrics, and both optimizer learning rates:
+TensorBoard logs include text CE, overall and non-PAD text accuracy, validation
+metrics, and both optimizer learning rates:
 
 ```bash
 tensorboard --logdir runs/stt_continuation/tensorboard

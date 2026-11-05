@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 from smollm_moshi_stt_continuation import (
     STTContinuationConfig,
     SmolLM2MoshiSTTContinuation,
-    masked_stt_continuation_loss,
+    masked_text_continuation_loss,
 )
 from stt_continuation_dataset import DailyTalkDataset, collate_dailytalk
 
@@ -36,10 +36,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temporal-learning-rate", type=float, default=2e-5)
     parser.add_argument("--num-codebooks", type=int, default=4)
     parser.add_argument("--audio-card", type=int, default=2048)
-    parser.add_argument("--depformer-dim", type=int, default=1024)
-    parser.add_argument("--depformer-heads", type=int, default=16)
-    parser.add_argument("--depformer-layers", type=int, default=6)
-    parser.add_argument("--depformer-ffn-dim", type=int, default=4096)
     parser.add_argument("--context", type=int, default=3000)
     parser.add_argument("--text-delay", type=float, default=2.0)
     parser.add_argument("--acoustic-delay", type=int, default=2)
@@ -76,18 +72,12 @@ def print_model_summary(
     *,
     full: bool = False,
 ) -> None:
-    groups = {"temporal": 0, "depformer": 0, "streams_and_heads": 0}
-    depformer_prefixes = (
-        "depformer.", "depformer_in.", "depformer_emb.",
-        "depformer_text_emb.", "depformer_norms.", "linears.",
-    )
+    groups = {"temporal": 0, "streams_and_text_head": 0}
     for name, parameter in model.named_parameters():
         if name.startswith("transformer."):
             groups["temporal"] += parameter.numel()
-        elif name.startswith(depformer_prefixes):
-            groups["depformer"] += parameter.numel()
         else:
-            groups["streams_and_heads"] += parameter.numel()
+            groups["streams_and_text_head"] += parameter.numel()
 
     total = sum(parameter.numel() for parameter in model.parameters())
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
@@ -95,13 +85,10 @@ def print_model_summary(
     print("model structure:")
     print(f"  temporal: SmolLM2 hidden={model.dim} context={config.context}")
     print(
-        f"  depformer: dim={config.depformer_dim} heads={config.depformer_num_heads} "
-        f"layers={config.depformer_num_layers} ffn={config.depformer_dim_feedforward}"
-    )
-    print(
-        f"  streams: text=1 audio={config.num_codebooks} card={config.audio_card} "
+        f"  inputs: text=1 audio={config.num_codebooks} card={config.audio_card} "
         f"delays={config.delays}"
     )
+    print("  objective: text continuation only (no audio prediction head)")
     for name, count in groups.items():
         print(f"  parameters/{name}: {count / 1e6:.2f}M")
     print(f"  parameters/total: {total / 1e6:.2f}M (trainable {trainable / 1e6:.2f}M)")
@@ -180,9 +167,10 @@ def evaluate(
             else contextlib.nullcontext()
         )
         with autocast:
-            output = model(streams)
-            _, metrics = masked_stt_continuation_loss(
-                output,
+            text_logits, text_mask = model.forward_text_training(streams)
+            _, metrics = masked_text_continuation_loss(
+                text_logits,
+                text_mask,
                 streams,
                 text_padding_id=text_padding_id,
             )
@@ -215,10 +203,6 @@ def main() -> None:
         assistant_end_id=base_text_card + 5,
         audio_card=args.audio_card,
         num_codebooks=args.num_codebooks,
-        depformer_dim=args.depformer_dim,
-        depformer_num_heads=args.depformer_heads,
-        depformer_num_layers=args.depformer_layers,
-        depformer_dim_feedforward=args.depformer_ffn_dim,
         context=args.context,
         text_delay_seconds=args.text_delay,
         acoustic_delay_steps=args.acoustic_delay,
@@ -266,7 +250,7 @@ def main() -> None:
 
     if args.smoke_test:
         # Valid DSM controls plus random Mimi codes. This checks the complete
-        # Temporal -> Depformer -> loss -> backward path without a dataset.
+        # audio-conditioned text loss and backward path without a dataset.
         smoke_frames = max(64, max(config.delays) + 8)
         text = torch.randint(0, 100, (1, smoke_frames), device=device)
         audio = torch.randint(
@@ -361,9 +345,10 @@ def main() -> None:
                 else contextlib.nullcontext()
             )
             with autocast:
-                output = model(streams)
-                loss, metrics = masked_stt_continuation_loss(
-                    output,
+                text_logits, text_mask = model.forward_text_training(streams)
+                loss, metrics = masked_text_continuation_loss(
+                    text_logits,
+                    text_mask,
                     streams,
                     text_padding_id=config.text_padding_id,
                 )
@@ -380,16 +365,11 @@ def main() -> None:
                     writer.add_scalar(name, value.item(), step)
                 writer.add_scalar("optimizer/temporal_lr", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
-                rq_accuracy = " ".join(
-                    f"rq{q}={metrics[f'rq/{q}_accuracy'].item():.3f}"
-                    for q in range(args.num_codebooks)
-                )
                 print(
                     f"step={step} loss={metrics['loss/total'].item():.4f} "
-                    f"audio={metrics['loss/audio'].item():.4f} "
                     f"text={metrics['loss/text'].item():.4f} "
-                    f"text_np={metrics['text/non_pad_accuracy'].item():.3f} "
-                    f"{rq_accuracy}",
+                    f"text_acc={metrics['text/accuracy'].item():.3f} "
+                    f"text_np={metrics['text/non_pad_accuracy'].item():.3f}",
                     flush=True,
                 )
             if not args.smoke_test and step % args.save_every == 0:
@@ -407,13 +387,10 @@ def main() -> None:
                 )
                 for name, value in valid_metrics.items():
                     writer.add_scalar(f"valid/{name}", value, step)
-                valid_rq = " ".join(
-                    f"rq{q}={valid_metrics[f'rq/{q}_accuracy']:.3f}"
-                    for q in range(args.num_codebooks)
-                )
                 print(
                     f"valid step={step} loss={valid_metrics['loss/total']:.4f} "
-                    f"text_np={valid_metrics['text/non_pad_accuracy']:.3f} {valid_rq}",
+                    f"text_acc={valid_metrics['text/accuracy']:.3f} "
+                    f"text_np={valid_metrics['text/non_pad_accuracy']:.3f}",
                     flush=True,
                 )
             if step >= target_steps:

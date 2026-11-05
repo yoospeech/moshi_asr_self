@@ -1,9 +1,4 @@
-"""SmolLM2 temporal backbone with Moshi's original Depth Transformer.
-
-The temporal stack is replaced by a pretrained Hugging Face causal model.  All
-audio delay handling and the teacher-forced Depformer path stay in Moshi's
-``LMModel`` implementation.
-"""
+"""Audio-conditioned SmolLM2 text-continuation model."""
 
 from __future__ import annotations
 
@@ -20,7 +15,8 @@ _MOSHI_SOURCE = Path(__file__).resolve().parent / "thirdparty" / "moshi" / "mosh
 if str(_MOSHI_SOURCE) not in sys.path:
     sys.path.insert(0, str(_MOSHI_SOURCE))
 
-from moshi.models.lm import LMModel, LMOutput  # noqa: E402
+from moshi.models.lm import LMModel  # noqa: E402
+from moshi.models.lm_utils import _delay_sequence, _undelay_sequence  # noqa: E402
 
 
 @dataclass
@@ -29,10 +25,6 @@ class STTContinuationConfig:
     text_card: int = 49154
     audio_card: int = 2048
     num_codebooks: int = 4
-    depformer_dim: int = 1024
-    depformer_num_heads: int = 16
-    depformer_num_layers: int = 6
-    depformer_dim_feedforward: int = 4096
     context: int = 3000
     frame_rate: float = 12.5
     text_delay_seconds: float = 2.0
@@ -70,12 +62,12 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         dim = int(temporal_config.hidden_size)
         self.stt_continuation_config = config
 
-        # LMModel creates the exact Moshi embeddings, delay logic and
-        # Depformer. Its temporal transformer is replaced immediately below.
+        # Keep Moshi's stream embeddings and delay metadata, but disable the
+        # audio Depformer: Mimi codes are conditioning inputs, not targets.
         super().__init__(
             delays=config.delays,
             n_q=config.num_codebooks,
-            dep_q=config.num_codebooks,
+            dep_q=0,
             card=config.audio_card,
             text_card=config.text_card,
             dim=dim,
@@ -86,18 +78,13 @@ class SmolLM2MoshiSTTContinuation(LMModel):
             causal=True,
             context=config.context,
             existing_text_padding_id=config.text_padding_id,
-            depformer_dim=config.depformer_dim,
-            depformer_dim_feedforward=config.depformer_dim_feedforward,
-            depformer_num_heads=config.depformer_num_heads,
-            depformer_num_layers=config.depformer_num_layers,
-            depformer_context=config.num_codebooks,
-            depformer_gating="silu",
-            depformer_pos_emb="none",
-            depformer_multi_linear=True,
-            depformer_weights_per_step=True,
             device=device,
             dtype=dtype,
         )
+        # LMModel allocates a projection even with dep_q=0; it is unreachable
+        # in text-only training/inference, so do not retain it in the model or
+        # checkpoints.
+        del self.depformer_in
 
         self.transformer = AutoModel.from_pretrained(
             config.temporal_model,
@@ -145,41 +132,39 @@ class SmolLM2MoshiSTTContinuation(LMModel):
     def checkpoint_metadata(self) -> dict[str, object]:
         return asdict(self.stt_continuation_config)
 
+    def forward_text_training(
+        self, streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply Moshi delays and predict text without audio-token logits."""
+        batch, codebooks, _ = streams.shape
+        if codebooks != self.num_codebooks:
+            raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
+        initial = self._get_initial_token().expand(batch, -1, -1)
+        delayed = _delay_sequence(self.delays, streams, initial)
+        delayed = torch.cat([initial, delayed], dim=2)
+        _, text_logits = self.forward_text(delayed[:, :, :-1])
+        text_logits, text_mask = _undelay_sequence(
+            self.delays[:1], text_logits, fill_value=float("nan")
+        )
+        text_mask &= streams[:, :1] != self.zero_token_id
+        return text_logits, text_mask
 
-def masked_stt_continuation_loss(
-    output: LMOutput,
+
+def masked_text_continuation_loss(
+    text_logits: torch.Tensor,
+    text_mask: torch.Tensor,
     streams: torch.Tensor,
     *,
-    text_weight: float = 1.0,
-    audio_weight: float = 1.0,
-    semantic_weight: float = 100.0,
     text_padding_id: int | None = None,
     text_padding_weight: float = 0.5,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Equation 7: text CE plus normalized, semantic-weighted audio CE."""
-    audio_targets = streams[:, 1 : 1 + output.logits.shape[1]]
+    """Compute text-only CE conditioned on the input Mimi audio tokens."""
     text_targets = streams[:, :1]
-
-    per_codebook = []
-    metrics: dict[str, torch.Tensor] = {}
-    for codebook in range(output.logits.shape[1]):
-        mask = output.mask[:, codebook]
-        valid_logits = output.logits[:, codebook][mask].float()
-        valid_targets = audio_targets[:, codebook][mask]
-        codebook_loss = nn.functional.cross_entropy(valid_logits, valid_targets)
-        per_codebook.append(codebook_loss)
-        metrics[f"rq/{codebook}_loss"] = codebook_loss.detach()
-        metrics[f"rq/{codebook}_accuracy"] = (
-            valid_logits.argmax(dim=-1) == valid_targets
-        ).float().mean().detach()
-    audio_weights = output.logits.new_ones(len(per_codebook), dtype=torch.float32)
-    audio_weights[0] = semantic_weight
-    audio_losses = torch.stack(per_codebook)
-    audio_loss = (audio_losses * audio_weights).sum() / audio_weights.sum()
-
-    text_logits = output.text_logits[output.text_mask].float()
-    valid_text_targets = text_targets[output.text_mask]
-    text_losses = nn.functional.cross_entropy(text_logits, valid_text_targets, reduction="none")
+    valid_text_logits = text_logits[text_mask].float()
+    valid_text_targets = text_targets[text_mask]
+    text_losses = nn.functional.cross_entropy(
+        valid_text_logits, valid_text_targets, reduction="none"
+    )
     if text_padding_id is not None:
         weights = torch.where(
             valid_text_targets == text_padding_id,
@@ -189,8 +174,7 @@ def masked_stt_continuation_loss(
         text_loss = (text_losses * weights).sum() / weights.sum()
     else:
         text_loss = text_losses.mean()
-    total = audio_weight * audio_loss + text_weight * text_loss
-    text_predictions = text_logits.argmax(dim=-1)
+    text_predictions = valid_text_logits.argmax(dim=-1)
     non_pad_text_mask = (
         valid_text_targets != text_padding_id
         if text_padding_id is not None
@@ -199,13 +183,12 @@ def masked_stt_continuation_loss(
     non_pad_text_accuracy = (
         (text_predictions[non_pad_text_mask] == valid_text_targets[non_pad_text_mask]).float().mean()
         if non_pad_text_mask.any()
-        else text_logits.new_zeros(())
+        else valid_text_logits.new_zeros(())
     )
-    metrics.update({
-        "loss/total": total.detach(),
-        "loss/audio": audio_loss.detach(),
+    metrics = {
+        "loss/total": text_loss.detach(),
         "loss/text": text_loss.detach(),
         "text/accuracy": (text_predictions == valid_text_targets).float().mean().detach(),
         "text/non_pad_accuracy": non_pad_text_accuracy.detach(),
-    })
-    return total, metrics
+    }
+    return text_loss, metrics

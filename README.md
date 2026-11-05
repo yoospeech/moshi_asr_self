@@ -9,12 +9,11 @@ Mimi converts user speech into one semantic and three acoustic token streams.
 ## Architecture
 
 - SmolLM2-135M Temporal Transformer
-- Moshi Depth Transformer with per-RQ parameters
 - four online-extracted Mimi codebooks
 - 12.5 Hz PAD/EPAD text timeline from word timestamps
 - stream order `[shared-text, user-semantic, user-acoustic-1, user-acoustic-2, user-acoustic-3]`
 - delay pattern `[25, 0, 2, 2, 2]`
-- semantic-token loss weight 100, acoustic-token weights 1
+- text-only continuation loss conditioned on Mimi audio tokens
 
 User semantic audio leads text by 25 frames, or 2 seconds at 12.5 Hz. The
 acoustic codebooks trail the semantic codebook by two frames. This pattern is
@@ -32,9 +31,14 @@ follows the role marker directly: `PAD ... EPAD -> USER_BEGIN -> first word`
 or `PAD ... EPAD -> ASSISTANT_BEGIN -> first word`. A second EPAD is not added
 between BEGIN and that first word.
 
-Training retains Moshi's joint text/audio objective. At streaming inference,
-all four Mimi audio streams must be force-fed from user audio and only the
-delayed text stream is sampled.
+Training uses all four Mimi audio streams as conditioning inputs and optimizes
+only the delayed shared-text continuation loss. There is no audio-token
+prediction objective or Depformer. At streaming inference, the Mimi streams are
+force-fed from user audio and only the delayed text stream is sampled.
+
+Checkpoints produced by the earlier joint audio/text objective contain
+Depformer parameters and are not compatible with this text-only architecture;
+start a new training run and output directory after this change.
 
 ## Setup
 
@@ -97,10 +101,6 @@ CUDA_VISIBLE_DEVICES=0,1 python3 train_stt_continuation.py \
   --num-codebooks 4 \
   --text-delay 2.0 \
   --acoustic-delay 2 \
-  --depformer-dim 512 \
-  --depformer-heads 8 \
-  --depformer-layers 4 \
-  --depformer-ffn-dim 2048 \
   --batch-size 2 \
   --grad-accum 2 \
   --steps 100000 \
