@@ -127,26 +127,21 @@ user waveform and samples only the shared text stream. Extra silence keeps the
 audio clock running while the assistant-text tail is generated.
 
 ```bash
-python3 infer_stt_continuation.py \
+cd /home/speech/Documents/workspace/moshi_stt_self
+
+CUDA_VISIBLE_DEVICES=0 \
+PYTHONPATH=thirdparty/moshi/moshi \
+/data/util/anaconda3/envs/duplexomni/bin/python \
+infer_stt_continuation.py \
   --checkpoint runs/stt_continuation/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --tail-seconds 10 \
-  --device auto \
-  --output inference_outputs/0.json
-```
-
-Use deterministic greedy decoding for checkpoint comparisons:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 infer_stt_continuation.py \
-  --checkpoint runs/stt_continuation/checkpoint_00100000.pt \
-  --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
-  --user-channel 1 \
+  --text-temperature 0.7 \
+  --text-top-k 25 \
   --device cuda \
   --mimi-device cuda:0 \
-  --greedy \
-  --output inference_outputs/0.greedy.json
+  --output inference_outputs/0.json
 ```
 
 Without `--greedy`, text is sampled with `--text-temperature 0.7` and
@@ -154,6 +149,6 @@ Without `--greedy`, text is sampled with `--text-temperature 0.7` and
 checkpoint step, decoding settings, and frame/time/token events. Mono input
 automatically uses channel 0.
 
-This implementation recomputes the SmolLM2 prefix at each frame. It is a
-correctness-oriented reference for forced-audio generation, not yet a
-latency-optimized live streaming loop.
+See [STT_CONTINUATION_INFERENCE.md](STT_CONTINUATION_INFERENCE.md) for greedy
+decoding, channel selection, output format, device options, and current
+streaming limitations.
