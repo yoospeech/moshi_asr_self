@@ -24,6 +24,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", help="override temporal_model in config")
     parser.add_argument("--mimi-checkpoint")
     parser.add_argument("--mimi-repo", default=moshi_loaders.DEFAULT_REPO)
+    parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto",
+        help="language-model device; auto uses CUDA when available (default: auto)",
+    )
     parser.add_argument("--mimi-device")
     parser.add_argument("--tail-seconds", type=float, default=10.0)
     parser.add_argument("--text-temperature", type=float, default=0.7)
@@ -157,8 +161,18 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     config = load_config(args)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+    device_name = args.device
+    if device_name == "auto":
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    if device_name == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("--device cuda requested, but CUDA is not available")
+    device = torch.device(device_name)
+    dtype = (
+        torch.bfloat16
+        if device.type == "cuda" and torch.cuda.is_bf16_supported()
+        else torch.float32
+    )
+    print(f"loading model on {device} with dtype={dtype}", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(config.temporal_model)
     model = SmolLM2MoshiSTTContinuation(config, dtype=dtype, device=device)
@@ -193,6 +207,12 @@ def main() -> None:
         "audio": str(Path(args.audio)),
         "user_channel": args.user_channel,
         "checkpoint_step": package.get("step"),
+        "decoding": {
+            "greedy": args.greedy,
+            "temperature": args.text_temperature,
+            "top_k": args.text_top_k,
+            "seed": args.seed,
+        },
         "decoded_text": decoded,
         "events": events,
     }

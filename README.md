@@ -132,8 +132,27 @@ python3 infer_stt_continuation.py \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --tail-seconds 10 \
+  --device auto \
   --output inference_outputs/0.json
 ```
+
+Use deterministic greedy decoding for checkpoint comparisons:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 infer_stt_continuation.py \
+  --checkpoint runs/stt_continuation/checkpoint_00100000.pt \
+  --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
+  --user-channel 1 \
+  --device cuda \
+  --mimi-device cuda:0 \
+  --greedy \
+  --output inference_outputs/0.greedy.json
+```
+
+Without `--greedy`, text is sampled with `--text-temperature 0.7` and
+`--text-top-k 25` by default. The output JSON contains the decoded text,
+checkpoint step, decoding settings, and frame/time/token events. Mono input
+automatically uses channel 0.
 
 This implementation recomputes the SmolLM2 prefix at each frame. It is a
 correctness-oriented reference for forced-audio generation, not yet a
