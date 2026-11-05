@@ -110,6 +110,26 @@ The output contains the decoded lexical text and every predicted text event:
     "seed": 42
   },
   "decoded_text": "...",
+  "turns": [
+    {
+      "speaker": "user",
+      "text": "Hello",
+      "start_frame": 25,
+      "end_frame": 40,
+      "start_time": 2.0,
+      "end_time": 3.2,
+      "complete": true
+    },
+    {
+      "speaker": "assistant",
+      "text": "Hi",
+      "start_frame": 45,
+      "end_frame": 60,
+      "start_time": 3.6,
+      "end_time": 4.8,
+      "complete": true
+    }
+  ],
   "events": [
     {
       "frame": 0,
@@ -121,9 +141,12 @@ The output contains the decoded lexical text and every predicted text event:
 }
 ```
 
-`events` preserves `PAD`, `EPAD`, `USER_BEGIN`, `USER_END`,
-`ASSISTANT_BEGIN`, and `ASSISTANT_END`. `decoded_text` contains only lexical
-token IDs decoded with the SmolLM2 tokenizer.
+`turns` parses `USER_BEGIN/USER_END` and
+`ASSISTANT_BEGIN/ASSISTANT_END` into clean chronological dialogue turns.
+`complete` is false when generation ends or a new BEGIN arrives before the
+matching END token. `events` preserves `PAD`, `EPAD`, and all four boundary
+tokens for frame-level debugging. `decoded_text` contains all lexical token IDs
+decoded with the SmolLM2 tokenizer.
 
 ## Device options
 
@@ -142,4 +165,3 @@ backbone is Hugging Face SmolLM2 rather than Moshi's native streaming
 Transformer, the script recomputes the full text/audio prefix for each frame.
 It force-feeds audio with the correct delay pattern, but it is not yet an
 optimized real-time inference loop.
-

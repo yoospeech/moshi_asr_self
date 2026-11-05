@@ -134,7 +134,7 @@ def force_audio_sample_text(
 
 def render_tokens(
     token_ids: list[int], tokenizer: AutoTokenizer, config: STTContinuationConfig
-) -> tuple[str, list[dict[str, object]]]:
+) -> tuple[str, list[dict[str, object]], list[dict[str, object]]]:
     special = {
         config.text_padding_id: "PAD",
         config.text_epad_id: "EPAD",
@@ -145,6 +145,30 @@ def render_tokens(
     }
     events: list[dict[str, object]] = []
     lexical: list[int] = []
+    turns: list[dict[str, object]] = []
+    active_speaker: str | None = None
+    active_tokens: list[int] = []
+    active_start_frame: int | None = None
+
+    def finish_turn(end_frame: int, complete: bool) -> None:
+        nonlocal active_speaker, active_tokens, active_start_frame
+        if active_speaker is None or active_start_frame is None:
+            return
+        turns.append(
+            {
+                "speaker": active_speaker,
+                "text": tokenizer.decode(active_tokens, skip_special_tokens=False).strip(),
+                "start_frame": active_start_frame,
+                "end_frame": end_frame,
+                "start_time": active_start_frame / config.frame_rate,
+                "end_time": end_frame / config.frame_rate,
+                "complete": complete,
+            }
+        )
+        active_speaker = None
+        active_tokens = []
+        active_start_frame = None
+
     for frame, token_id in enumerate(token_ids):
         if token_id in special:
             label = special[token_id]
@@ -154,7 +178,24 @@ def render_tokens(
         else:
             label = f"UNKNOWN_{token_id}"
         events.append({"frame": frame, "time": frame / config.frame_rate, "id": token_id, "token": label})
-    return tokenizer.decode(lexical, skip_special_tokens=False), events
+
+        if token_id == config.user_begin_id:
+            finish_turn(frame, complete=False)
+            active_speaker = "user"
+            active_start_frame = frame
+        elif token_id == config.assistant_begin_id:
+            finish_turn(frame, complete=False)
+            active_speaker = "assistant"
+            active_start_frame = frame
+        elif token_id == config.user_end_id and active_speaker == "user":
+            finish_turn(frame, complete=True)
+        elif token_id == config.assistant_end_id and active_speaker == "assistant":
+            finish_turn(frame, complete=True)
+        elif active_speaker is not None and 0 <= token_id < len(tokenizer):
+            active_tokens.append(token_id)
+
+    finish_turn(len(token_ids), complete=False)
+    return tokenizer.decode(lexical, skip_special_tokens=False), events, turns
 
 
 def main() -> None:
@@ -202,7 +243,7 @@ def main() -> None:
         top_k=args.text_top_k,
         greedy=args.greedy,
     )
-    decoded, events = render_tokens(generated, tokenizer, config)
+    decoded, events, turns = render_tokens(generated, tokenizer, config)
     payload = {
         "audio": str(Path(args.audio)),
         "user_channel": args.user_channel,
@@ -214,6 +255,7 @@ def main() -> None:
             "seed": args.seed,
         },
         "decoded_text": decoded,
+        "turns": turns,
         "events": events,
     }
     output = Path(args.output)
