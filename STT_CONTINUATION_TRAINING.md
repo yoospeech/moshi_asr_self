@@ -45,6 +45,14 @@ torchrun. `--batch-size` is per rank and `--steps` counts microbatches.
 - `audio_acc`: mean accuracy across four Mimi codebooks during validation.
 - `loss`: assistant CE plus weighted audio CE.
 
+`--text-padding-weight 0.5` weights each PAD frame at 0.5 while lexical and
+EPAD targets remain at 1.0. Non-PAD targets therefore contribute twice as
+much per frame. This affects text loss only and does not redefine accuracy.
+
+The recommended objective weights are `--text-loss-weight 10.0` and
+`--audio-loss-weight 1.0`, giving assistant continuation text priority while
+retaining Depth Transformer audio prediction as an auxiliary task.
+
 Deterministic train/validation indices are saved to `OUTPUT/split.json`.
 TensorBoard events are saved to `OUTPUT/tensorboard`.
 

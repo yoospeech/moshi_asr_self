@@ -37,7 +37,9 @@ class STTContinuationConfig:
     depformer_layers: int = 6
     depformer_ffn_dim: int = 4096
     audio_loss_weight: float = 1.0
+    text_loss_weight: float = 10.0
     semantic_loss_weight: float = 100.0
+    text_padding_weight: float = 0.5
     text_padding_id: int = 49152
     text_epad_id: int = 49153
 
@@ -246,6 +248,7 @@ def masked_multistream_loss(
     audio_logits: torch.Tensor | None = None,
     audio_mask: torch.Tensor | None = None,
     audio_loss_weight: float = 1.0,
+    text_loss_weight: float = 10.0,
     semantic_loss_weight: float = 100.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute Moshi-style assistant text and user audio CE losses."""
@@ -283,7 +286,7 @@ def masked_multistream_loss(
         metrics[f"{name}/non_pad_accuracy"] = non_pad_accuracy.detach()
 
     text_loss = torch.stack(channel_losses).mean()
-    total = text_loss
+    total = text_loss_weight * text_loss
     if audio_logits is not None and audio_mask is not None:
         audio_targets = streams[:, 1:]
         per_codebook = []
@@ -302,7 +305,7 @@ def masked_multistream_loss(
         weights[0] = semantic_loss_weight
         audio_loss = (torch.stack(per_codebook) * weights).sum() / weights.sum()
         audio_accuracy = torch.stack(accuracies).mean()
-        total = text_loss + audio_loss_weight * audio_loss
+        total = text_loss_weight * text_loss + audio_loss_weight * audio_loss
         metrics["loss/user_audio"] = audio_loss.detach()
         metrics["user_audio/accuracy"] = audio_accuracy.detach()
     metrics["loss/total"] = total.detach()

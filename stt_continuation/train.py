@@ -89,7 +89,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depformer-layers", type=int, default=6)
     parser.add_argument("--depformer-ffn-dim", type=int, default=4096)
     parser.add_argument("--audio-loss-weight", type=float, default=1.0)
+    parser.add_argument("--text-loss-weight", type=float, default=10.0)
     parser.add_argument("--semantic-loss-weight", type=float, default=100.0)
+    parser.add_argument(
+        "--text-padding-weight",
+        type=float,
+        default=0.5,
+        help="PAD loss weight relative to non-PAD text tokens (default: 0.5)",
+    )
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--tensorboard-dir")
@@ -239,9 +246,11 @@ def evaluate(
                 text_logits, text_mask,
                 streams,
                 text_padding_id=text_padding_id,
+                text_padding_weight=config.text_padding_weight,
                 audio_logits=audio_logits,
                 audio_mask=audio_mask,
                 audio_loss_weight=config.audio_loss_weight,
+                text_loss_weight=config.text_loss_weight,
                 semantic_loss_weight=config.semantic_loss_weight,
             )
         for name, value in metrics.items():
@@ -312,7 +321,9 @@ def run_training() -> None:
         depformer_layers=args.depformer_layers,
         depformer_ffn_dim=args.depformer_ffn_dim,
         audio_loss_weight=args.audio_loss_weight,
+        text_loss_weight=args.text_loss_weight,
         semantic_loss_weight=args.semantic_loss_weight,
+        text_padding_weight=args.text_padding_weight,
     )
     model = SmolLM2MoshiSTTContinuation(config, dtype=dtype, device=device)
     model.train()
@@ -349,6 +360,8 @@ def run_training() -> None:
     objective = TrainingObjective(
         model,
         config.text_padding_id,
+        config.text_padding_weight,
+        config.text_loss_weight,
         config.audio_loss_weight,
         config.semantic_loss_weight,
     )

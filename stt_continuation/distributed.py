@@ -37,10 +37,15 @@ def barrier():
 class TrainingObjective(nn.Module):
     """DDP must invoke forward, not a method on the unwrapped model."""
 
-    def __init__(self, model, padding_id, audio_loss_weight, semantic_loss_weight):
+    def __init__(
+        self, model, padding_id, padding_weight, text_loss_weight,
+        audio_loss_weight, semantic_loss_weight
+    ):
         super().__init__()
         self.model = model
         self.padding_id = padding_id
+        self.padding_weight = padding_weight
+        self.text_loss_weight = text_loss_weight
         self.audio_loss_weight = audio_loss_weight
         self.semantic_loss_weight = semantic_loss_weight
 
@@ -49,6 +54,8 @@ class TrainingObjective(nn.Module):
         return masked_multistream_loss(
             text_logits, text_mask, streams,
             text_padding_id=self.padding_id,
+            text_padding_weight=self.padding_weight,
+            text_loss_weight=self.text_loss_weight,
             audio_logits=audio_logits,
             audio_mask=audio_mask,
             audio_loss_weight=self.audio_loss_weight,
