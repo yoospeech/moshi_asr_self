@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-every", type=int, default=500)
     parser.add_argument("--valid-batches", type=int, default=20)
     parser.add_argument("--min-duration", type=float, default=5.0)
-    parser.add_argument("--max-duration", type=float, default=45.0)
+    parser.add_argument("--max-duration", type=float, default=200.0)
     parser.add_argument("--min-words", type=int, default=5)
     parser.add_argument("--min-words-per-second", type=float, default=0.5)
     parser.add_argument("--max-words-per-second", type=float, default=2.5)

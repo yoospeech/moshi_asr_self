@@ -138,7 +138,7 @@ assistant-side `data_stereo/N.json`.
 
 Default filters retain conversations with:
 
-- duration between 5 and 45 seconds;
+- duration between 5 and 200 seconds;
 - at least 5 aligned words;
 - 0.5 to 2.5 aligned words per second;
 - valid word timestamps;
@@ -200,7 +200,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --learning-rate 2e-4 \
   --temporal-learning-rate 2e-5 \
   --min-duration 5 \
-  --max-duration 45 \
+  --max-duration 200 \
   --min-words 5 \
   --min-words-per-second 0.5 \
   --max-words-per-second 2.5 \

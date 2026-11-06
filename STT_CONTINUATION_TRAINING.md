@@ -72,6 +72,8 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --batch-size 2 \
   --grad-accum 2 \
   --steps 100000 \
+  --min-duration 5 \
+  --max-duration 200 \
   --output runs/lfm3_1_7b_stt_continuation_delay1
 ```
 
