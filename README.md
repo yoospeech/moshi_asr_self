@@ -1,10 +1,11 @@
-# SmolLM2 Moshi STT Continuation
+# Moshi STT Continuation
 
 > **Development status:** experimental research prototype under active development.
 
 User-only streaming STT-continuation experiment based on Moshi's delayed-stream
-modeling architecture. SmolLM2-135M is the Temporal Transformer, while frozen
-Mimi converts user speech into one semantic and three acoustic token streams.
+modeling architecture. LFM3-1.7B or SmolLM2 can be used as the Temporal
+Transformer, while frozen Mimi converts user speech into one semantic and three
+acoustic token streams.
 
 ## Repository layout
 
@@ -28,7 +29,7 @@ with `python -m unittest discover -s tests -v`.
 
 ## Model architecture
 
-- SmolLM2-135M Temporal Transformer
+- LFM3-1.7B Temporal Transformer (recommended; SmolLM2 remains supported)
 - four online-extracted Mimi codebooks
 - 12.5 Hz PAD/EPAD text timeline from word timestamps
 - stream order `[assistant-text, user-text, user-semantic, user-acoustic-1, user-acoustic-2, user-acoustic-3]`
@@ -98,8 +99,11 @@ pip install -r requirements.txt
 pip install -e thirdparty/moshi/moshi
 ```
 
-Place SmolLM2 at `models/SmolLM2-135M`. If `--mimi-checkpoint` is omitted, the
-Mimi checkpoint is resolved from `kyutai/moshiko-pytorch-bf16`.
+Passing `--model LiquidAI/LFM3-1.7B` downloads the model and tokenizer into the
+Hugging Face cache when they are not already available. LFM3 custom model code
+is trusted automatically. A local model directory can be passed instead. If
+`--mimi-checkpoint` is omitted, the Mimi checkpoint is resolved from
+`kyutai/moshiko-pytorch-bf16`.
 
 ## Data
 
@@ -152,7 +156,7 @@ cd /home/speech/Documents/workspace/moshi_stt_self
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 train_stt_continuation.py \
-  --model models/SmolLM2-135M \
+  --model LiquidAI/LFM3-1.7B \
   --smoke-test \
   --smoke-steps 1 \
   --text-delay 0.08 \
@@ -177,7 +181,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --nproc_per_node=2 \
   train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
-  --model models/SmolLM2-135M \
+  --model LiquidAI/LFM3-1.7B \
   --num-codebooks 4 \
   --text-delay 0.08 \
   --continuation-delay-steps 0 \

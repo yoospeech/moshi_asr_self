@@ -5,8 +5,8 @@ The training path is:
 `two aligned text streams + user Mimi streams -> SmolLM2 -> two text heads + Moshi Depth Transformer`
 
 Moshi's delayed-stream transformation, masks, and audio Depth Transformer are
-retained. The Temporal Transformer is replaced with the local SmolLM2
-checkpoint, and user text is added as one extra Temporal channel.
+retained. The Temporal Transformer uses LFM3-1.7B (or another compatible
+Hugging Face base model), and user text is added as one extra Temporal channel.
 
 ## Delay pattern
 
@@ -57,6 +57,7 @@ Then train on aligned data:
 CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --standalone --nproc_per_node=2 train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
+  --model LiquidAI/LFM3-1.7B \
   --num-codebooks 4 \
   --text-delay 0.08 \
   --continuation-delay-steps 0 \
@@ -97,7 +98,7 @@ Test DDP before a full run (uses synthetic tokens, without loading Mimi):
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --standalone --nproc_per_node=2 train_stt_continuation.py \
-  --model models/SmolLM2-135M --smoke-test --smoke-steps 5 --grad-accum 2 \
+  --model LiquidAI/LFM3-1.7B --smoke-test --smoke-steps 5 --grad-accum 2 \
   --output runs/ddp_smoke
 ```
 

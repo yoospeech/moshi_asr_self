@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--audio", required=True, help="stereo or mono user-audio input")
     parser.add_argument("--user-channel", type=int, default=1)
     parser.add_argument("--model", help="override temporal_model in config")
+    parser.add_argument(
+        "--trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override the checkpoint setting for custom Hugging Face model code",
+    )
     parser.add_argument("--mimi-checkpoint")
     parser.add_argument("--mimi-repo", default=moshi_loaders.DEFAULT_REPO)
     parser.add_argument(
@@ -51,6 +57,11 @@ def load_config(args: argparse.Namespace) -> STTContinuationConfig:
     values = {key: value for key, value in raw.items() if key in names}
     if args.model:
         values["temporal_model"] = args.model
+    trust_remote_code = getattr(args, "trust_remote_code", None)
+    if trust_remote_code is not None:
+        values["trust_remote_code"] = trust_remote_code
+    elif args.model and "lfm3" in args.model.lower():
+        values["trust_remote_code"] = True
     config = STTContinuationConfig(**values)
     expected_delays = [0, 1, 0] + [1] * (config.num_codebooks - 1)
     if config.delays != expected_delays:
@@ -190,7 +201,10 @@ def main() -> None:
     )
     print(f"loading model on {device} with dtype={dtype}", flush=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(config.temporal_model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.temporal_model,
+        trust_remote_code=config.trust_remote_code,
+    )
     model = SmolLM2MoshiSTTContinuation(config, dtype=dtype, device=device)
     package = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(package["model"], strict=True)

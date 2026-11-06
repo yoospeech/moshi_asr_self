@@ -1,4 +1,4 @@
-"""Audio-conditioned SmolLM2 text-continuation model."""
+"""Audio-conditioned Hugging Face temporal model for STT continuation."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from moshi.models.lm_utils import _delay_sequence, _undelay_sequence  # noqa: E4
 @dataclass
 class STTContinuationConfig:
     temporal_model: str = "models/SmolLM2-135M"
+    trust_remote_code: bool = False
     text_card: int = 49154
     audio_card: int = 2048
     num_codebooks: int = 4
@@ -85,7 +86,10 @@ class SmolLM2MoshiSTTContinuation(LMModel):
             raise ValueError(
                 "continuation_delay_steps must be 0 for assistant inner-monologue"
             )
-        temporal_config = AutoConfig.from_pretrained(config.temporal_model)
+        temporal_config = AutoConfig.from_pretrained(
+            config.temporal_model,
+            trust_remote_code=config.trust_remote_code,
+        )
         dim = int(temporal_config.hidden_size)
         self.stt_continuation_config = config
 
@@ -132,6 +136,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         self.transformer = AutoModel.from_pretrained(
             config.temporal_model,
             torch_dtype=dtype,
+            trust_remote_code=config.trust_remote_code,
         ).to(device=device)
         self.out_norm = nn.Identity()
         self._seed_text_embeddings_from_temporal()
@@ -169,7 +174,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         cross_attention_src: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if cross_attention_src is not None:
-            raise ValueError("SmolLM2 temporal mode does not use Moshi cross-attention conditions")
+            raise ValueError("Hugging Face temporal mode does not use Moshi cross-attention conditions")
 
         _, codebooks, _ = sequence.shape
         if codebooks != self.num_codebooks:

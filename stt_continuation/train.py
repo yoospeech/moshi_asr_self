@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest")
     parser.add_argument("--model", default="models/SmolLM2-135M")
+    parser.add_argument(
+        "--trust-remote-code",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="allow custom Hugging Face model code; enabled automatically for LFM3",
+    )
     parser.add_argument("--mimi-checkpoint")
     parser.add_argument("--mimi-repo", default=moshi_loaders.DEFAULT_REPO)
     parser.add_argument("--mimi-device", help="e.g. cuda:1; defaults to the training device")
@@ -99,7 +105,10 @@ def print_model_summary(
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     parameter_bytes = sum(parameter.numel() * parameter.element_size() for parameter in model.parameters())
     print("model structure:")
-    print(f"  temporal: SmolLM2 hidden={model.dim} context={config.context}")
+    print(
+        f"  temporal: {config.temporal_model} hidden={model.dim} "
+        f"context={config.context}"
+    )
     print(
         f"  inputs: text=2 audio={config.num_codebooks} card={config.audio_card} "
         f"delays={config.delays}"
@@ -239,11 +248,20 @@ def run_training() -> None:
     torch.manual_seed(args.seed)
     dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    trust_remote_code = (
+        args.trust_remote_code
+        if args.trust_remote_code is not None
+        else "lfm3" in args.model.lower()
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        trust_remote_code=trust_remote_code,
+    )
     base_text_card = len(tokenizer)
     # PAD and EPAD are shared vocabulary rows; timelines and heads are separate.
     config = STTContinuationConfig(
         temporal_model=args.model,
+        trust_remote_code=trust_remote_code,
         text_card=base_text_card + 2,
         text_padding_id=base_text_card,
         text_epad_id=base_text_card + 1,
