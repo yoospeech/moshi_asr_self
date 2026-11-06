@@ -56,11 +56,18 @@ pip install -r requirements.txt
 pip install -e thirdparty/moshi/moshi
 ```
 
-`--model LiquidAI/LFM3-1.7B` downloads the model to `models/LFM3-1.7B`
-when absent. In DDP, rank 0 downloads it and the other ranks wait. LFM3 remote
-model code is trusted automatically; the explicit flag below documents that
-requirement. If `--mimi-checkpoint` is omitted, Mimi is resolved from the
-configured Kyutai repository.
+Model paths are standardized under the project `models/` directory:
+
+```text
+models/SmolLM2-135M
+models/LFM3-1.7B
+```
+
+If either known path is absent, rank 0 downloads the corresponding official
+Hugging Face repository into that path and the other DDP ranks wait. LFM3
+remote model code is trusted automatically; SmolLM2 does not require it. An
+arbitrary Hugging Face repository ID or existing local directory is also
+accepted. If `--mimi-checkpoint` is omitted, Mimi is resolved from Kyutai.
 
 ## Data
 
@@ -90,9 +97,8 @@ cd /home/speech/Documents/workspace/moshi_stt_self
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 train_stt_continuation.py \
-  --model LiquidAI/LFM3-1.7B \
+  --model models/SmolLM2-135M \
   --model-download-root models \
-  --trust-remote-code \
   --smoke-test \
   --smoke-steps 1 \
   --acoustic-delay 1 \
@@ -114,9 +120,8 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --nproc_per_node=2 \
   train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.jsonl \
-  --model LiquidAI/LFM3-1.7B \
+  --model models/SmolLM2-135M \
   --model-download-root models \
-  --trust-remote-code \
   --num-codebooks 4 \
   --continuation-delay-steps 0 \
   --acoustic-delay 1 \
@@ -142,8 +147,23 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --log-every 10 \
   --save-every 500 \
   --print-model \
+  --output runs/smollm2_135m_moshi_continuation
+```
+
+### LFM3-1.7B alternative
+
+LFM3-1.7B uses the same architecture, streams, targets, losses, and inference
+code. To run the larger model, change these arguments:
+
+```bash
+  --model models/LFM3-1.7B \
+  --model-download-root models \
+  --trust-remote-code \
   --output runs/lfm3_1_7b_moshi_continuation
 ```
+
+SmolLM2-135M is the documented default for pipeline validation and small-data
+overfitting. LFM3-1.7B is the higher-capacity alternative.
 
 Do not pass `--mimi-device` in DDP; every rank places frozen Mimi and its model
 on the local GPU. Batch size is per rank, so the effective batch above is
@@ -168,7 +188,7 @@ PAD occupies many frames, so `assistant_all_accuracy` is usually higher. Use
 `assistant_np_accuracy` to judge whether actual continuation tokens improve.
 
 ```bash
-tensorboard --logdir runs/lfm3_1_7b_moshi_continuation/tensorboard
+tensorboard --logdir runs/smollm2_135m_moshi_continuation/tensorboard
 ```
 
 ## Inference
@@ -180,7 +200,7 @@ CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 infer_stt_continuation.py \
-  --checkpoint runs/lfm3_1_7b_moshi_continuation/checkpoint_00100000.pt \
+  --checkpoint runs/smollm2_135m_moshi_continuation/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --device cuda \

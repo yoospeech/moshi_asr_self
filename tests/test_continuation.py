@@ -15,6 +15,7 @@ from stt_continuation.model import (
     STTContinuationConfig, SmolLM2MoshiSTTContinuation, masked_multistream_loss,
 )
 from stt_continuation.inference import force_audio_sample_text, load_config
+from stt_continuation.train import resolve_model_source
 
 
 class AlignmentTests(unittest.TestCase):
@@ -62,6 +63,19 @@ class AlignmentTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_models_directory_aliases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "models"
+            path, repository = resolve_model_source(
+                str(root / "SmolLM2-135M"), str(root)
+            )
+            self.assertEqual(path, root / "SmolLM2-135M")
+            self.assertEqual(repository, "HuggingFaceTB/SmolLM2-135M")
+            path.mkdir(parents=True)
+            existing, repository = resolve_model_source(str(path), str(root))
+            self.assertEqual(existing, path)
+            self.assertIsNone(repository)
+
     def test_inference_rejects_incompatible_delay_pattern(self):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"

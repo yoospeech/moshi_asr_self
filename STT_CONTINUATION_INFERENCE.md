@@ -13,7 +13,7 @@ CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 infer_stt_continuation.py \
-  --checkpoint runs/lfm3_1_7b_moshi_continuation/checkpoint_00100000.pt \
+  --checkpoint runs/smollm2_135m_moshi_continuation/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --device cuda \
@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 infer_stt_continuation.py \
-  --checkpoint runs/lfm3_1_7b_moshi_continuation/checkpoint_00100000.pt \
+  --checkpoint runs/smollm2_135m_moshi_continuation/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --device cuda \
@@ -67,4 +67,4 @@ Inference requires `text_context_mode: "moshi"` and delay pattern
 `[0, 0, 1, 1, 1]`. Dual-text/ASR checkpoints are rejected.
 
 The reference loop recomputes the complete prefix for every frame. It does not
-yet use a streaming KV cache and can be very slow with LFM3-1.7B.
+yet use a streaming KV cache, so long inputs remain slow even with SmolLM2.

@@ -26,7 +26,14 @@ current-frame; acoustic codebooks are delayed by one frame.
 
 Use the complete tested command in
 [README.md](README.md#two-gpu-ddp-training). It reads the original
-`dailytalk.jsonl` and writes to `runs/lfm3_1_7b_moshi_continuation`.
+`dailytalk.jsonl`, uses `models/SmolLM2-135M`, and writes to
+`runs/smollm2_135m_moshi_continuation`.
+
+The documented commands use local paths under `models/`. Both
+`models/LFM3-1.7B` and `models/SmolLM2-135M` are recognized aliases and are
+downloaded automatically when absent. SmolLM2 does not need
+`--trust-remote-code`; LFM3 does. Keep their checkpoints in separate output
+folders.
 
 DDP uses one model and frozen Mimi per GPU. Do not pass `--mimi-device` under
 torchrun. `--batch-size` is per rank and `--steps` counts microbatches.

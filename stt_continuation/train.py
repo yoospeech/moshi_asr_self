@@ -26,6 +26,32 @@ from .distributed import TrainingObjective, setup, barrier
 from moshi.models import loaders as moshi_loaders
 
 
+MODEL_REPOSITORIES = {
+    "SmolLM2-135M": "HuggingFaceTB/SmolLM2-135M",
+    "LFM3-1.7B": "LiquidAI/LFM3-1.7B",
+}
+
+
+def resolve_model_source(model: str, download_root: str) -> tuple[Path, str | None]:
+    """Return the local model path and an optional repository to download."""
+    requested = Path(model)
+    if requested.exists():
+        return requested, None
+    basename = model.rstrip("/").rsplit("/", 1)[-1]
+    local_path = Path(download_root) / basename
+    if local_path.exists():
+        return local_path, None
+    if requested.parent.name == "models" or "/" not in model:
+        repository = MODEL_REPOSITORIES.get(basename)
+        if repository is None:
+            raise FileNotFoundError(
+                f"unknown local model alias {model!r}; pass an existing path or a Hugging Face repo ID"
+            )
+    else:
+        repository = model
+    return local_path, repository
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest")
@@ -247,12 +273,13 @@ def run_training() -> None:
     torch.manual_seed(args.seed)
     dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
-    model_path = Path(args.model)
-    if not model_path.exists():
-        model_path = Path(args.model_download_root) / args.model.rsplit("/", 1)[-1]
+    model_path, model_repository = resolve_model_source(
+        args.model, args.model_download_root
+    )
+    if model_repository is not None:
         if primary:
-            print(f"downloading {args.model} to {model_path}", flush=True)
-            snapshot_download(repo_id=args.model, local_dir=model_path)
+            print(f"downloading {model_repository} to {model_path}", flush=True)
+            snapshot_download(repo_id=model_repository, local_dir=model_path)
         barrier()
         if not model_path.exists():
             raise FileNotFoundError(f"downloaded model directory not found: {model_path}")
@@ -261,7 +288,7 @@ def run_training() -> None:
     trust_remote_code = (
         args.trust_remote_code
         if args.trust_remote_code is not None
-        else "lfm3" in args.model.lower()
+        else "lfm3" in model_name.lower()
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_name,
