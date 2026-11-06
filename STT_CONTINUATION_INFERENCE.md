@@ -5,6 +5,12 @@ encodes the selected user waveform into four audio codebooks. Those audio
 tokens are force-fed at every frame. ASR and continuation text are sampled from
 independent output channels.
 
+Each channel conditions on user audio and its own generated text history only.
+Changing ASR text does not change continuation logits, or vice versa, for fixed
+weights and audio. Both channels default to a 25-frame delay. Use checkpoints
+whose config records `text_context_mode: independent`; older mixed-context
+checkpoints require their original inference code and cannot be silently reused.
+
 Both text channels retain Moshi's existing PAD/EPAD alignment tokens:
 
 ```text

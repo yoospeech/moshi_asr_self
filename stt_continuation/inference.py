@@ -42,6 +42,11 @@ def load_config(args: argparse.Namespace) -> STTContinuationConfig:
     checkpoint = Path(args.checkpoint)
     config_path = Path(args.config) if args.config else checkpoint.parent / "config.json"
     raw = json.loads(config_path.read_text(encoding="utf-8"))
+    if raw.get("text_context_mode") != "independent":
+        raise ValueError(
+            "Checkpoint uses the older mixed text context. Use its original inference "
+            "code or train a new independent-context checkpoint."
+        )
     names = {field.name for field in fields(STTContinuationConfig)}
     values = {key: value for key, value in raw.items() if key in names}
     if args.model:

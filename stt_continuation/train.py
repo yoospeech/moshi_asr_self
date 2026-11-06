@@ -43,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context", type=int, default=3000)
     parser.add_argument("--text-delay", type=float, default=2.0)
     parser.add_argument(
-        "--continuation-delay-steps", type=int, default=1,
-        help="extra continuation delay after the ASR text stream",
+        "--continuation-delay-steps", type=int, default=0,
+        help="additional continuation timing offset; text contexts remain independent",
     )
     parser.add_argument("--acoustic-delay", type=int, default=2)
     parser.add_argument("--save-every", type=int, default=500)

@@ -82,6 +82,21 @@ class ModelTests(unittest.TestCase):
             )
             model = SmolLM2MoshiSTTContinuation(cfg, device="cpu", dtype=torch.float32)
             model.eval()
+            self.assertEqual(cfg.delays, [25, 25, 0, 2, 2, 2])
+            # Change all tokens (including validity masks) on one text channel.
+            # The other channel must remain identical for every batch item.
+            probe = torch.randint(0, 16, (2, 6, 12))
+            probe[:, 2:, 6:] = -1
+            with torch.no_grad():
+                _, baseline = model.forward_text(probe)
+                for channel in (0, 1):
+                    changed_probe = probe.clone()
+                    changed_probe[:, channel] = -1
+                    _, modified = model.forward_text(changed_probe)
+                    torch.testing.assert_close(
+                        baseline[:, 1-channel], modified[:, 1-channel], rtol=0, atol=0,
+                    )
+                    self.assertFalse(torch.equal(baseline[:, channel], modified[:, channel]))
             audio = torch.randint(0, 16, (1, 4, 8))
             observed = []
             forward = model.forward_text

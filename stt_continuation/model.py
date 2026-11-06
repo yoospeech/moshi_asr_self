@@ -29,7 +29,8 @@ class STTContinuationConfig:
     context: int = 3000
     frame_rate: float = 12.5
     text_delay_seconds: float = 2.0
-    continuation_delay_steps: int = 1
+    continuation_delay_steps: int = 0
+    text_context_mode: str = "independent"
     acoustic_delay_steps: int = 2
     text_padding_id: int = 49152
     text_epad_id: int = 49153
@@ -44,8 +45,7 @@ class STTContinuationConfig:
 
     @property
     def delays(self) -> list[int]:
-        # ASR text follows user audio; continuation follows ASR by one or more
-        # pattern steps so it can condition on the aligned ASR token.
+        # Timing offsets do not create cross-channel text conditioning.
         return [self.text_delay_steps, self.continuation_text_delay_steps, 0] + [
             self.acoustic_delay_steps
         ] * (
@@ -75,6 +75,8 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
+        if config.text_context_mode != "independent":
+            raise ValueError("This model requires independent text contexts")
         temporal_config = AutoConfig.from_pretrained(config.temporal_model)
         dim = int(temporal_config.hidden_size)
         self.stt_continuation_config = config
@@ -160,23 +162,32 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
 
-        hidden = self.text_emb(sequence[:, 0])
-        hidden = hidden + self.continuation_text_emb(sequence[:, 1])
+        asr_hidden = self.text_emb(sequence[:, 0])
+        continuation_hidden = self.continuation_text_emb(sequence[:, 1])
+        audio_hidden = torch.zeros_like(asr_hidden)
         for index, embedding in enumerate(self.emb):
-            hidden = hidden + embedding(sequence[:, index + self.audio_offset])
+            audio_hidden = audio_hidden + embedding(sequence[:, index + self.audio_offset])
         if sum_condition is not None:
-            hidden = hidden + sum_condition.to(hidden)
+            audio_hidden = audio_hidden + sum_condition.to(audio_hidden)
 
-        attention_mask = (sequence != self.zero_token_id).any(dim=1)
+        # Separate batch rows have separate attention histories, while sharing
+        # Transformer weights. Neither branch receives the other text channel.
+        hidden = torch.cat([asr_hidden + audio_hidden, continuation_hidden + audio_hidden], dim=0)
+        audio_mask = (sequence[:, self.audio_offset:] != self.zero_token_id).any(dim=1)
+        attention_mask = torch.cat([
+            audio_mask | (sequence[:, 0] != self.zero_token_id),
+            audio_mask | (sequence[:, 1] != self.zero_token_id),
+        ], dim=0)
         output = self.transformer(
             inputs_embeds=hidden,
             attention_mask=attention_mask,
             use_cache=False,
             return_dict=True,
         )
-        temporal_hidden = output.last_hidden_state
-        asr_logits = self.text_linear(temporal_hidden)
-        continuation_logits = self.continuation_text_linear(temporal_hidden)
+        asr_state, continuation_state = output.last_hidden_state.chunk(2, dim=0)
+        temporal_hidden = torch.stack([asr_state, continuation_state], dim=1)
+        asr_logits = self.text_linear(asr_state)
+        continuation_logits = self.continuation_text_linear(continuation_state)
         return temporal_hidden, torch.stack([asr_logits, continuation_logits], dim=1)
 
     def checkpoint_metadata(self) -> dict[str, object]:

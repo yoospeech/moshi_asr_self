@@ -19,12 +19,13 @@ The physical stream order is:
 The delay pattern is:
 
 ```text
-[25, 26, 0, 2, 2, 2]
+[25, 25, 0, 2, 2, 2]
 ```
 
 At 12.5 Hz, ASR text is delayed by 25 frames, or 2 seconds, relative to user
-semantic audio. Continuation text is delayed one additional pattern step, so
-continuation frame `t` can condition on ASR frame `t`. Acoustic streams are
+semantic audio. Continuation uses the same delay by default. Each branch sees
+only user audio and its own past text; Transformer weights are shared but
+attention histories are separate batch rows. Acoustic streams are
 delayed by two frames relative to semantic audio. The online stream builder
 appends enough PAD frames to preserve both delayed text targets.
 
@@ -56,7 +57,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --num-codebooks 4 \
   --text-delay 2.0 \
-  --continuation-delay-steps 1 \
+  --continuation-delay-steps 0 \
   --acoustic-delay 2 \
   --batch-size 2 \
   --grad-accum 2 \

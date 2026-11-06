@@ -32,7 +32,7 @@ with `python -m unittest discover -s tests -v`.
 - four online-extracted Mimi codebooks
 - 12.5 Hz PAD/EPAD text timeline from word timestamps
 - stream order `[asr-text, continuation-text, user-semantic, user-acoustic-1, user-acoustic-2, user-acoustic-3]`
-- delay pattern `[25, 26, 0, 2, 2, 2]`
+- delay pattern `[25, 25, 0, 2, 2, 2]`
 - independent ASR and continuation text losses conditioned on Mimi audio tokens
 
 User semantic audio leads text by 25 frames, or 2 seconds at 12.5 Hz. The
@@ -43,6 +43,15 @@ Only the user waveform is supplied to Mimi. Text uses two independent streams
 on the same 12.5 Hz clock. Stream 0 contains aligned user ASR targets and
 stream 1 contains aligned assistant continuation targets. Overlapping text no
 longer competes for one frame. There is no assistant audio stream.
+
+Each text branch sees only user audio and its own text history. Branches are
+stacked along the batch dimension and processed with shared Transformer weights;
+they never attend to each other's text. Gradients still update shared weights.
+Both text delays default to 25 frames, without imposing a speaker order.
+Temporal compute and activation memory grow roughly twofold versus mixed context.
+New checkpoints record `text_context_mode: independent`; the inference CLI rejects
+older mixed-context configs to avoid silently changing their behavior. Train into
+a new output directory for this architecture.
 
 Each text channel independently follows Moshi's original PAD/EPAD rule. Every
 word starts at its timestamped frame, with EPAD in the preceding frame unless
@@ -128,7 +137,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --model models/SmolLM2-135M \
   --num-codebooks 4 \
   --text-delay 2.0 \
-  --continuation-delay-steps 1 \
+  --continuation-delay-steps 0 \
   --acoustic-delay 2 \
   --batch-size 2 \
   --grad-accum 2 \
@@ -162,6 +171,9 @@ More details are in
 The reference inference path force-feeds every Mimi codebook from the selected
 user waveform and samples separate ASR and continuation text streams. Extra
 silence keeps the audio clock running while the continuation tail is generated.
+Both streams are generated from user audio and their own previously generated
+text only; neither stream receives the other stream's text. Use a checkpoint
+trained with the independent-context configuration described above.
 
 ```bash
 cd /home/speech/Documents/workspace/moshi_stt_self
@@ -183,8 +195,10 @@ infer_stt_continuation.py \
 
 Without `--greedy`, text is sampled with `--text-temperature 0.7` and
 `--text-top-k 25` by default. The output JSON contains the decoded text,
-checkpoint step, decoding settings, and frame/time/token events. Mono input
-automatically uses channel 0.
+checkpoint step, decoding settings, readable `transcript` and `turns` fields,
+and frame/time/token events. `transcript.user_asr` and
+`transcript.assistant_continuation` are the concise results; `channels.*.events`
+is the detailed PAD/EPAD/token timeline. Mono input automatically uses channel 0.
 
 See [STT_CONTINUATION_INFERENCE.md](STT_CONTINUATION_INFERENCE.md) for greedy
 decoding, channel selection, output format, device options, and current
