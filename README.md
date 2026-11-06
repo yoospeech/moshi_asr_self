@@ -6,39 +6,61 @@ User-only streaming STT-continuation experiment based on Moshi's delayed-stream
 modeling architecture. SmolLM2-135M is the Temporal Transformer, while frozen
 Mimi converts user speech into one semantic and three acoustic token streams.
 
-## Architecture
+## Repository layout
+
+```text
+stt_continuation/
+  model.py          # temporal model, two text heads, losses
+  dataset.py        # user_hyp and assistant alignments, PAD/EPAD
+  train.py          # training and validation
+  inference.py      # force-fed user audio, two text outputs
+scripts/
+  transcribe_user_hyp.py
+tests/
+  test_continuation.py
+train_stt_continuation.py  # CLI entry point
+infer_stt_continuation.py  # CLI entry point
+```
+
+The root CLI commands below remain supported. Offline regression checks run
+with `python -m unittest discover -s tests -v`.
+
+## Model architecture
 
 - SmolLM2-135M Temporal Transformer
 - four online-extracted Mimi codebooks
 - 12.5 Hz PAD/EPAD text timeline from word timestamps
-- stream order `[shared-text, user-semantic, user-acoustic-1, user-acoustic-2, user-acoustic-3]`
-- delay pattern `[25, 0, 2, 2, 2]`
-- text-only continuation loss conditioned on Mimi audio tokens
+- stream order `[asr-text, continuation-text, user-semantic, user-acoustic-1, user-acoustic-2, user-acoustic-3]`
+- delay pattern `[25, 26, 0, 2, 2, 2]`
+- independent ASR and continuation text losses conditioned on Mimi audio tokens
 
 User semantic audio leads text by 25 frames, or 2 seconds at 12.5 Hz. The
 acoustic codebooks trail the semantic codebook by two frames. This pattern is
 the four-codebook form derived from Moshi Appendix C, Figure 8.
 
-Only the user waveform is supplied to Mimi. The single shared text stream
-contains both sides in chronological speaker runs:
-`USER_BEGIN ... user text ... USER_END`, followed by
-`ASSISTANT_BEGIN ... assistant text ... ASSISTANT_END` (and repeated for later
-turns). Within each region, Moshi's original `EPAD -> word pieces -> PAD`
-alignment is unchanged. There is no assistant audio stream.
+Only the user waveform is supplied to Mimi. Text uses two independent streams
+on the same 12.5 Hz clock. Stream 0 contains aligned user ASR targets and
+stream 1 contains aligned assistant continuation targets. Overlapping text no
+longer competes for one frame. There is no assistant audio stream.
 
-At a region boundary, the last PAD position becomes EPAD and the first word
-follows the role marker directly: `PAD ... EPAD -> USER_BEGIN -> first word`
-or `PAD ... EPAD -> ASSISTANT_BEGIN -> first word`. A second EPAD is not added
-between BEGIN and that first word.
+Each text channel independently follows Moshi's original PAD/EPAD rule. Every
+word starts at its timestamped frame, with EPAD in the preceding frame unless
+that would overwrite a lexical token. A word beginning at frame zero instead
+uses EPAD at frame zero and shifts its lexical pieces by one frame. No speaker
+BEGIN/END tokens are used: channel 0 is user ASR and channel 1 is assistant
+continuation (the inner-monologue target).
 
 Training uses all four Mimi audio streams as conditioning inputs and optimizes
-only the delayed shared-text continuation loss. There is no audio-token
-prediction objective or Depformer. At streaming inference, the Mimi streams are
-force-fed from user audio and only the delayed text stream is sampled.
+the two delayed text losses. There is no audio-token prediction objective or
+Depformer. At inference, Mimi streams are force-fed while ASR and continuation
+text are sampled autoregressively.
 
 Checkpoints produced by the earlier joint audio/text objective contain
 Depformer parameters and are not compatible with this text-only architecture;
 start a new training run and output directory after this change.
+
+Single-text checkpoints and checkpoints with speaker BEGIN/END tokens are
+also incompatible with the two-head, PAD/EPAD-only vocabulary.
 
 ## Setup
 
@@ -54,9 +76,12 @@ Mimi checkpoint is resolved from `kyutai/moshiko-pytorch-bf16`.
 
 ## Data
 
-The trainer reads the DailyTalkContiguous manifest and adjacent word-alignment
-JSON files. The selected user waveform is resampled to 24 kHz, and frozen Mimi
-extracts four audio codebooks online.
+The trainer takes `dailytalk.user_hyp.jsonl` produced by the transcription
+script. User ASR targets come directly from each row's `user_hyp.words`, while
+continuation/inner-monologue targets come from the timestamped `alignments` in
+`data_stereo/N.json`. The generated `data_stereo/user_N.json` files are retained
+as a compatibility fallback. The selected user waveform is resampled to 24 kHz,
+and frozen Mimi extracts four audio codebooks online.
 
 Generate `user_hyp` text and word timestamps with whisper-timestamped Medium:
 
@@ -87,6 +112,7 @@ Default filters retain conversations with:
 - 0.5 to 2.5 aligned words per second;
 - valid word timestamps;
 - target-speech coverage between 5% and 80%.
+- no same-channel lexical BPE collision at 12.5 Hz.
 
 ## Training
 
@@ -95,11 +121,12 @@ visible GPU 1:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 train_stt_continuation.py \
-  --manifest /data/db/daily-talk-contiguous/dailytalk.jsonl \
+  --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --model models/SmolLM2-135M \
   --mimi-device cuda:1 \
   --num-codebooks 4 \
   --text-delay 2.0 \
+  --continuation-delay-steps 1 \
   --acoustic-delay 2 \
   --batch-size 2 \
   --grad-accum 2 \
@@ -123,8 +150,8 @@ More details are in
 ## Reference inference
 
 The reference inference path force-feeds every Mimi codebook from the selected
-user waveform and samples only the shared text stream. Extra silence keeps the
-audio clock running while the assistant-text tail is generated.
+user waveform and samples separate ASR and continuation text streams. Extra
+silence keeps the audio clock running while the continuation tail is generated.
 
 ```bash
 cd /home/speech/Documents/workspace/moshi_stt_self

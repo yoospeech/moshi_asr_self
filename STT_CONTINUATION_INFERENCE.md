@@ -2,15 +2,14 @@
 
 This guide runs inference with a trained STT-continuation checkpoint. Mimi
 encodes the selected user waveform into four audio codebooks. Those audio
-tokens are force-fed at every frame, and only the shared text channel is
-sampled.
+tokens are force-fed at every frame. ASR and continuation text are sampled from
+independent output channels.
 
-The expected text sequence contains the existing PAD/EPAD alignment tokens and
-the four region markers:
+Both text channels retain Moshi's existing PAD/EPAD alignment tokens:
 
 ```text
-PAD ... EPAD USER_BEGIN user text USER_END
-PAD ... EPAD ASSISTANT_BEGIN assistant text ASSISTANT_END
+channel 0 (ASR):          PAD ... EPAD user text
+channel 1 (continuation): PAD ... EPAD assistant inner-monologue text
 ```
 
 There is no assistant audio input or output.
@@ -109,44 +108,23 @@ The output contains the decoded lexical text and every predicted text event:
     "top_k": 25,
     "seed": 42
   },
-  "decoded_text": "...",
-  "turns": [
-    {
-      "speaker": "user",
-      "text": "Hello",
-      "start_frame": 25,
-      "end_frame": 40,
-      "start_time": 2.0,
-      "end_time": 3.2,
-      "complete": true
+  "asr_text": "Hello",
+  "continuation_text": "Hi",
+  "channels": {
+    "asr": {
+      "events": []
     },
-    {
-      "speaker": "assistant",
-      "text": "Hi",
-      "start_frame": 45,
-      "end_frame": 60,
-      "start_time": 3.6,
-      "end_time": 4.8,
-      "complete": true
+    "continuation": {
+      "events": []
     }
-  ],
-  "events": [
-    {
-      "frame": 0,
-      "time": 0.0,
-      "id": 49153,
-      "token": "EPAD"
-    }
-  ]
+  }
 }
 ```
 
-`turns` parses `USER_BEGIN/USER_END` and
-`ASSISTANT_BEGIN/ASSISTANT_END` into clean chronological dialogue turns.
-`complete` is false when generation ends or a new BEGIN arrives before the
-matching END token. `events` preserves `PAD`, `EPAD`, and all four boundary
-tokens for frame-level debugging. `decoded_text` contains all lexical token IDs
-decoded with the SmolLM2 tokenizer.
+`channels.asr.events` and `channels.continuation.events` preserve PAD, EPAD,
+and lexical predictions for frame-level debugging. Speaker BEGIN/END markers
+and parsed turns are intentionally absent because stream identity carries the
+role: ASR is user text and continuation is assistant inner-monologue text.
 
 ## Device options
 
