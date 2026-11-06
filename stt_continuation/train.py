@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 from .model import (
     STTContinuationConfig,
     SmolLM2MoshiSTTContinuation,
-    masked_text_continuation_loss,
+    masked_multistream_loss,
 )
 from .dataset import DailyTalkDataset, collate_dailytalk
 from .distributed import TrainingObjective, setup, barrier
@@ -41,12 +41,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-codebooks", type=int, default=4)
     parser.add_argument("--audio-card", type=int, default=2048)
     parser.add_argument("--context", type=int, default=3000)
-    parser.add_argument("--text-delay", type=float, default=2.0)
+    parser.add_argument("--text-delay", type=float, default=0.08,
+                        help="user ASR text delay in seconds; default one frame at 12.5 Hz")
     parser.add_argument(
         "--continuation-delay-steps", type=int, default=0,
-        help="additional continuation timing offset; text contexts remain independent",
+        help="must remain 0 for assistant inner-monologue timing",
     )
-    parser.add_argument("--acoustic-delay", type=int, default=2)
+    parser.add_argument("--acoustic-delay", type=int, default=1)
+    parser.add_argument("--depformer-dim", type=int, default=1024)
+    parser.add_argument("--depformer-heads", type=int, default=16)
+    parser.add_argument("--depformer-layers", type=int, default=6)
+    parser.add_argument("--depformer-ffn-dim", type=int, default=4096)
+    parser.add_argument("--audio-loss-weight", type=float, default=1.0)
+    parser.add_argument("--semantic-loss-weight", type=float, default=100.0)
     parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--tensorboard-dir")
@@ -97,7 +104,7 @@ def print_model_summary(
         f"  inputs: text=2 audio={config.num_codebooks} card={config.audio_card} "
         f"delays={config.delays}"
     )
-    print("  objective: ASR + continuation text (user audio is force-fed)")
+    print("  objective: assistant text + user text + user audio Depth Transformer")
     for name, count in groups.items():
         print(f"  parameters/{name}: {count / 1e6:.2f}M")
     print(f"  parameters/total: {total / 1e6:.2f}M (trainable {trainable / 1e6:.2f}M)")
@@ -157,13 +164,13 @@ def online_streams(
         )
     ):
         valid_audio_frames = min(audio_frames, audio_codes.shape[-1])
-        streams[index, 0, :asr_frames] = asr_tokens[index, :asr_frames]
-        streams[index, 0, asr_frames : asr_frames + tail] = config.text_padding_id
-        streams[index, 1, :continuation_frames] = continuation_tokens[
+        streams[index, 1, :asr_frames] = asr_tokens[index, :asr_frames]
+        streams[index, 1, asr_frames : asr_frames + tail] = config.text_padding_id
+        streams[index, 0, :continuation_frames] = continuation_tokens[
             index, :continuation_frames
         ]
         streams[
-            index, 1, continuation_frames : continuation_frames + tail
+            index, 0, continuation_frames : continuation_frames + tail
         ] = config.text_padding_id
         streams[index, 2:, :valid_audio_frames] = audio_codes[index, :, :valid_audio_frames]
     return streams
@@ -193,12 +200,15 @@ def evaluate(
             else contextlib.nullcontext()
         )
         with autocast:
-            text_logits, text_mask = model.forward_text_training(streams)
-            _, metrics = masked_text_continuation_loss(
-                text_logits,
-                text_mask,
+            text_logits, text_mask, audio_logits, audio_mask = model.forward_training(streams)
+            _, metrics = masked_multistream_loss(
+                text_logits, text_mask,
                 streams,
                 text_padding_id=text_padding_id,
+                audio_logits=audio_logits,
+                audio_mask=audio_mask,
+                audio_loss_weight=config.audio_loss_weight,
+                semantic_loss_weight=config.semantic_loss_weight,
             )
         for name, value in metrics.items():
             totals[name] = totals.get(name, 0.0) + value.item()
@@ -243,6 +253,12 @@ def run_training() -> None:
         text_delay_seconds=args.text_delay,
         continuation_delay_steps=args.continuation_delay_steps,
         acoustic_delay_steps=args.acoustic_delay,
+        depformer_dim=args.depformer_dim,
+        depformer_heads=args.depformer_heads,
+        depformer_layers=args.depformer_layers,
+        depformer_ffn_dim=args.depformer_ffn_dim,
+        audio_loss_weight=args.audio_loss_weight,
+        semantic_loss_weight=args.semantic_loss_weight,
     )
     model = SmolLM2MoshiSTTContinuation(config, dtype=dtype, device=device)
     model.train()
@@ -276,7 +292,12 @@ def run_training() -> None:
         ) from error
     writer = SummaryWriter(log_dir=str(tensorboard_dir)) if primary else None
 
-    objective = TrainingObjective(model, config.text_padding_id)
+    objective = TrainingObjective(
+        model,
+        config.text_padding_id,
+        config.audio_loss_weight,
+        config.semantic_loss_weight,
+    )
     if world_size > 1:
         # The backbone's own token embedding is bypassed by inputs_embeds.
         objective = DistributedDataParallel(
@@ -430,10 +451,11 @@ def run_training() -> None:
                 writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
                 print(
                     f"step={step} loss={metrics['loss/total'].item():.4f} "
-                    f"asr={metrics['loss/asr'].item():.4f} "
-                    f"cont={metrics['loss/continuation'].item():.4f} "
-                    f"asr_np={metrics['asr/non_pad_accuracy'].item():.3f} "
-                    f"cont_np={metrics['continuation/non_pad_accuracy'].item():.3f}",
+                    f"user_text={metrics['loss/user'].item():.4f} "
+                    f"assistant_text={metrics['loss/assistant'].item():.4f} "
+                    f"audio={metrics['loss/user_audio'].item():.4f} "
+                    f"user_np={metrics['user/non_pad_accuracy'].item():.3f} "
+                    f"assistant_np={metrics['assistant/non_pad_accuracy'].item():.3f}",
                     flush=True,
                 )
             if primary and not args.smoke_test and step % args.save_every == 0:
@@ -456,8 +478,9 @@ def run_training() -> None:
                     writer.add_scalar(f"valid/{name}", value, step)
                 print(
                     f"valid step={step} loss={valid_metrics['loss/total']:.4f} "
-                    f"asr_np={valid_metrics['asr/non_pad_accuracy']:.3f} "
-                    f"cont_np={valid_metrics['continuation/non_pad_accuracy']:.3f}",
+                    f"user_np={valid_metrics['user/non_pad_accuracy']:.3f} "
+                    f"assistant_np={valid_metrics['assistant/non_pad_accuracy']:.3f} "
+                    f"audio_acc={valid_metrics['user_audio/accuracy']:.3f}",
                     flush=True,
                 )
             if validate:

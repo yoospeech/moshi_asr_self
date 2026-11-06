@@ -11,7 +11,7 @@ from transformers import LlamaConfig, LlamaModel
 
 from stt_continuation.dataset import DailyTalkDataset, TextAlignmentCollision
 from stt_continuation.model import (
-    STTContinuationConfig, SmolLM2MoshiSTTContinuation, masked_text_continuation_loss,
+    STTContinuationConfig, SmolLM2MoshiSTTContinuation, masked_multistream_loss,
 )
 from stt_continuation.inference import force_audio_sample_text
 
@@ -79,10 +79,25 @@ class ModelTests(unittest.TestCase):
             cfg = STTContinuationConfig(
                 temporal_model=directory, text_card=34,
                 text_padding_id=32, text_epad_id=33, audio_card=16,
+                depformer_dim=32, depformer_heads=4, depformer_layers=2,
+                depformer_ffn_dim=64,
             )
             model = SmolLM2MoshiSTTContinuation(cfg, device="cpu", dtype=torch.float32)
             model.eval()
-            self.assertEqual(cfg.delays, [25, 25, 0, 2, 2, 2])
+            self.assertEqual(cfg.delays, [0, 1, 0, 1, 1, 1])
+            # User text[t] must see semantic[t], but not semantic[t+1].
+            causal_probe = torch.randint(0, 16, (1, 6, 12))
+            with torch.no_grad():
+                reference = model.forward_training(causal_probe)[0]
+                changed = causal_probe.clone()
+                changed[:, 2, 4] = (changed[:, 2, 4] + 1) % cfg.audio_card
+                current = model.forward_training(changed)[0]
+                self.assertFalse(torch.equal(reference[:, 1, 4], current[:, 1, 4]))
+                torch.testing.assert_close(reference[:, 0, 4], current[:, 0, 4])
+                changed = causal_probe.clone()
+                changed[:, 2:, 5:] = (changed[:, 2:, 5:] + 1) % cfg.audio_card
+                future = model.forward_training(changed)[0]
+                torch.testing.assert_close(reference[:, 1, :5], future[:, 1, :5])
             # Change all tokens (including validity masks) on one text channel.
             # The other channel must remain identical for every batch item.
             probe = torch.randint(0, 16, (2, 6, 12))
@@ -114,10 +129,10 @@ class ModelTests(unittest.TestCase):
             self.assertEqual((len(a), len(c)), (8, 8))
             streams = torch.full((1, 6, 8 + max(cfg.delays)), -1, dtype=torch.long)
             streams[:, :2] = cfg.text_padding_id
-            streams[0, 0, :8] = torch.tensor(a)
-            streams[0, 1, :8] = torch.tensor(c)
+            streams[0, 0, :8] = torch.tensor(c)
+            streams[0, 1, :8] = torch.tensor(a)
             streams[:, 2:, :8] = audio
-            logits, mask = model.forward_text_training(streams)
+            logits, mask, audio_logits, audio_mask = model.forward_training(streams)
             for channel in range(2):
                 for t in range(8):
                     self.assertTrue(mask[0, channel, t])
@@ -126,13 +141,17 @@ class ModelTests(unittest.TestCase):
                         observed[t + cfg.delays[channel]][0, channel],
                         atol=1e-5, rtol=1e-5,
                     )
-            loss, before = masked_text_continuation_loss(logits, mask, streams)
+            self.assertEqual(audio_logits.shape, (1, 4, streams.shape[-1], 16))
+            self.assertTrue(audio_mask[:, :, :8].all())
+            loss, before = masked_multistream_loss(
+                logits, mask, streams, audio_logits=audio_logits, audio_mask=audio_mask,
+            )
             changed = streams.clone()
             changed[:, 1] = (changed[:, 1] + 1) % cfg.text_card
-            _, after = masked_text_continuation_loss(logits, mask, changed)
-            torch.testing.assert_close(before["loss/asr"], after["loss/asr"])
+            _, after = masked_multistream_loss(logits, mask, changed)
+            torch.testing.assert_close(before["loss/assistant"], after["loss/assistant"])
             loss.backward()
-            for head in (model.text_linear, model.continuation_text_linear):
+            for head in (model.text_linear, model.user_text_linear, model.linears[0]):
                 self.assertTrue(torch.isfinite(head.weight.grad).all())
                 self.assertGreater(head.weight.grad.abs().sum().item(), 0)
             checkpoint = Path(directory) / "roundtrip.pt"

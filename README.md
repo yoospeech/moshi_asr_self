@@ -31,23 +31,40 @@ with `python -m unittest discover -s tests -v`.
 - SmolLM2-135M Temporal Transformer
 - four online-extracted Mimi codebooks
 - 12.5 Hz PAD/EPAD text timeline from word timestamps
-- stream order `[asr-text, continuation-text, user-semantic, user-acoustic-1, user-acoustic-2, user-acoustic-3]`
-- delay pattern `[25, 25, 0, 2, 2, 2]`
-- independent ASR and continuation text losses conditioned on Mimi audio tokens
+- stream order `[assistant-text, user-text, user-semantic, user-acoustic-1, user-acoustic-2, user-acoustic-3]`
+- Moshi-derived ASR delay pattern `[0, 1, 0, 1, 1, 1]`
+- assistant text loss plus joint user text/audio losses
 
-User semantic audio leads text by 25 frames, or 2 seconds at 12.5 Hz. The
-acoustic codebooks trail the semantic codebook by two frames. This pattern is
-the four-codebook form derived from Moshi Appendix C, Figure 8.
+Assistant inner-monologue and user semantic audio use delay 0. User text is
+delayed by one frame (80 ms), so text[t] can see semantic audio[t]. It cannot
+yet see acoustic audio[t], which is also delayed by one frame. The acoustic codebooks
+trail the semantic codebook by one frame, matching Moshi Equation 6 and the
+released Moshi checkpoint configuration for acoustic delay `tau = 1`.
+
+At Temporal step `s`, the interleaved inputs are:
+
+| stream | token at step `s` |
+|---|---|
+| assistant text | `assistant_text[s]` |
+| user text | `user_text[s-1]` |
+| user semantic | `semantic[s]` |
+| user acoustic 1 | `acoustic_1[s-1]` |
+| user acoustic 2 | `acoustic_2[s-1]` |
+| user acoustic 3 | `acoustic_3[s-1]` |
+
+Consequently, `user_text[t]` is predicted at Temporal step `t+1`, after
+`semantic[t]` has entered the causal history.
 
 Only the user waveform is supplied to Mimi. Text uses two independent streams
-on the same 12.5 Hz clock. Stream 0 contains aligned user ASR targets and
-stream 1 contains aligned assistant continuation targets. Overlapping text no
+on the same 12.5 Hz clock. Stream 0 contains aligned assistant text targets and
+stream 1 contains aligned user ASR targets. Overlapping text no
 longer competes for one frame. There is no assistant audio stream.
 
 Each text branch sees only user audio and its own text history. Branches are
 stacked along the batch dimension and processed with shared Transformer weights;
 they never attend to each other's text. Gradients still update shared weights.
-Both text delays default to 25 frames, without imposing a speaker order.
+Assistant text keeps delay 0; user text uses delay 1 for audio-conditioned ASR.
+This sets stream timing without imposing a speaker order.
 Temporal compute and activation memory grow roughly twofold versus mixed context.
 New checkpoints record `text_context_mode: independent`; the inference CLI rejects
 older mixed-context configs to avoid silently changing their behavior. Train into
@@ -57,17 +74,17 @@ Each text channel independently follows Moshi's original PAD/EPAD rule. Every
 word starts at its timestamped frame, with EPAD in the preceding frame unless
 that would overwrite a lexical token. A word beginning at frame zero instead
 uses EPAD at frame zero and shifts its lexical pieces by one frame. No speaker
-BEGIN/END tokens are used: channel 0 is user ASR and channel 1 is assistant
-continuation (the inner-monologue target).
+BEGIN/END tokens are used: channel 0 is assistant text and channel 1 is user ASR.
 
-Training uses all four Mimi audio streams as conditioning inputs and optimizes
-the two delayed text losses. There is no audio-token prediction objective or
-Depformer. At inference, Mimi streams are force-fed while ASR and continuation
-text are sampled autoregressively.
+Training optimizes assistant text, user text, and user Mimi audio jointly. The
+native Moshi Depth Transformer predicts the four user codebooks autoregressively
+within each frame from the user Temporal hidden: semantic first, followed by
+three acoustic codebooks. At inference, the observed user Mimi streams are
+force-fed while user and assistant text are sampled independently; generated
+audio logits do not replace the observed audio.
 
-Checkpoints produced by the earlier joint audio/text objective contain
-Depformer parameters and are not compatible with this text-only architecture;
-start a new training run and output directory after this change.
+This is a joint text/audio training architecture, not the earlier text-only
+variant. Start a new training run and output directory after this change.
 
 Single-text checkpoints and checkpoints with speaker BEGIN/END tokens are
 also incompatible with the two-head, PAD/EPAD-only vocabulary.
@@ -126,6 +143,24 @@ Default filters retain conversations with:
 
 ## Training
 
+Verify the complete Temporal, two-text-head, Depth Transformer, loss, backward,
+and optimizer path before a full run:
+
+```bash
+cd /home/speech/Documents/workspace/moshi_stt_self
+
+PYTHONPATH=thirdparty/moshi/moshi \
+/data/util/anaconda3/envs/duplexomni/bin/python \
+train_stt_continuation.py \
+  --model models/SmolLM2-135M \
+  --smoke-test \
+  --smoke-steps 1 \
+  --text-delay 0.08 \
+  --acoustic-delay 1 \
+  --batch-size 1 \
+  --output /tmp/moshi_stt_smoke
+```
+
 For DDP on two available GPUs, launch one training process per GPU. Each rank
 loads its own trainable model and frozen Mimi on its local GPU. Omit
 `--mimi-device` in DDP mode:
@@ -144,9 +179,15 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --model models/SmolLM2-135M \
   --num-codebooks 4 \
-  --text-delay 2.0 \
+  --text-delay 0.08 \
   --continuation-delay-steps 0 \
-  --acoustic-delay 2 \
+  --acoustic-delay 1 \
+  --depformer-dim 1024 \
+  --depformer-heads 16 \
+  --depformer-layers 6 \
+  --depformer-ffn-dim 4096 \
+  --audio-loss-weight 1.0 \
+  --semantic-loss-weight 100 \
   --batch-size 2 \
   --grad-accum 2 \
   --steps 100000 \

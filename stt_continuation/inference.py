@@ -140,7 +140,8 @@ def force_audio_sample_text(
         pattern = torch.cat([pattern, frame], dim=-1)
         if step == 0 or (step + 1) % 25 == 0 or step + 1 == total_pattern_steps:
             print(f"inference frame {step + 1}/{total_pattern_steps}", flush=True)
-    return generated[0], generated[1]
+    # Physical text order is assistant first (Moshi convention), user second.
+    return generated[1], generated[0]
 
 
 def render_tokens(

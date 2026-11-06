@@ -2,36 +2,38 @@
 
 The training path is:
 
-`two aligned text streams + user Mimi streams -> SmolLM2 -> two text heads`
+`two aligned text streams + user Mimi streams -> SmolLM2 -> two text heads + Moshi Depth Transformer`
 
-Moshi's delayed-stream transformation and masks are retained, while the audio
-Depformer and audio-token prediction objective are disabled. The Temporal
-Transformer is replaced with the local SmolLM2 checkpoint.
+Moshi's delayed-stream transformation, masks, and audio Depth Transformer are
+retained. The Temporal Transformer is replaced with the local SmolLM2
+checkpoint, and user text is added as one extra Temporal channel.
 
 ## Delay pattern
 
 The physical stream order is:
 
 ```text
-[asr-text, continuation-text, semantic, acoustic-1, acoustic-2, acoustic-3]
+[assistant-text, user-text, user-semantic, user-acoustic-1, user-acoustic-2, user-acoustic-3]
 ```
 
 The delay pattern is:
 
 ```text
-[25, 25, 0, 2, 2, 2]
+[0, 1, 0, 1, 1, 1]
 ```
 
-At 12.5 Hz, ASR text is delayed by 25 frames, or 2 seconds, relative to user
-semantic audio. Continuation uses the same delay by default. Each branch sees
+Inner-monologue and semantic audio use delay 0. User text uses delay 1 (80 ms)
+to condition on its corresponding semantic audio frame. Each branch sees
 only user audio and its own past text; Transformer weights are shared but
 attention histories are separate batch rows. Acoustic streams are
-delayed by two frames relative to semantic audio. The online stream builder
+delayed by one frame relative to semantic audio. The online stream builder
 appends enough PAD frames to preserve both delayed text targets.
 
-The objective is the mean of ASR text CE and continuation text CE. Mimi audio
-tokens are conditioning inputs, not prediction targets. At inference, user
-Mimi tokens are forced and both text streams are sampled.
+The objective combines the mean of assistant/user text CE with the weighted
+user-audio CE. Moshi's native Depth Transformer predicts semantic then acoustic
+codebooks from the user branch hidden and preceding within-frame codebooks.
+At inference, user Mimi tokens are force-fed and only both text streams are
+sampled.
 
 The training manifest is `dailytalk.user_hyp.jsonl`, produced by
 `scripts/transcribe_user_hyp.py`. ASR targets come directly from each row's
@@ -56,17 +58,23 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --standalone --nproc_per_node=2 train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --num-codebooks 4 \
-  --text-delay 2.0 \
+  --text-delay 0.08 \
   --continuation-delay-steps 0 \
-  --acoustic-delay 2 \
+  --acoustic-delay 1 \
+  --depformer-dim 1024 \
+  --depformer-heads 16 \
+  --depformer-layers 6 \
+  --depformer-ffn-dim 4096 \
+  --audio-loss-weight 1.0 \
+  --semantic-loss-weight 100 \
   --batch-size 2 \
   --grad-accum 2 \
   --steps 100000 \
   --output runs/stt_continuation
 ```
 
-TensorBoard logs include separate ASR/continuation CE and non-PAD accuracy,
-validation metrics, and both optimizer learning rates:
+TensorBoard logs include separate user/assistant CE and non-PAD accuracy,
+user-audio Depth losses, validation metrics, and both optimizer learning rates:
 
 ```bash
 tensorboard --logdir runs/stt_continuation/tensorboard

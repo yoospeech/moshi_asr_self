@@ -1,21 +1,23 @@
 # STT Continuation Inference
 
 This guide runs inference with a trained STT-continuation checkpoint. Mimi
-encodes the selected user waveform into four audio codebooks. Those audio
-tokens are force-fed at every frame. ASR and continuation text are sampled from
-independent output channels.
+encodes the selected user waveform into four audio codebooks. Those observed
+audio tokens are force-fed at every frame. User and assistant text are sampled
+from independent output channels. The training-only Depth Transformer audio
+prediction is not sampled during inference.
 
 Each channel conditions on user audio and its own generated text history only.
 Changing ASR text does not change continuation logits, or vice versa, for fixed
-weights and audio. Both channels default to a 25-frame delay. Use checkpoints
+weights and audio. Assistant text uses delay 0; user text uses delay 1 (80 ms)
+to read the corresponding semantic audio before predicting text. Use checkpoints
 whose config records `text_context_mode: independent`; older mixed-context
 checkpoints require their original inference code and cannot be silently reused.
 
 Both text channels retain Moshi's existing PAD/EPAD alignment tokens:
 
 ```text
-channel 0 (ASR):          PAD ... EPAD user text
-channel 1 (continuation): PAD ... EPAD assistant inner-monologue text
+physical channel 0 (assistant): PAD ... EPAD assistant inner-monologue text
+physical channel 1 (user ASR):  PAD ... EPAD user text
 ```
 
 There is no assistant audio input or output.

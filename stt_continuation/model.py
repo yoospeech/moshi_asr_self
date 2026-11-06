@@ -28,10 +28,16 @@ class STTContinuationConfig:
     num_codebooks: int = 4
     context: int = 3000
     frame_rate: float = 12.5
-    text_delay_seconds: float = 2.0
+    text_delay_seconds: float = 0.08
     continuation_delay_steps: int = 0
     text_context_mode: str = "independent"
-    acoustic_delay_steps: int = 2
+    acoustic_delay_steps: int = 1
+    depformer_dim: int = 1024
+    depformer_heads: int = 16
+    depformer_layers: int = 6
+    depformer_ffn_dim: int = 4096
+    audio_loss_weight: float = 1.0
+    semantic_loss_weight: float = 100.0
     text_padding_id: int = 49152
     text_epad_id: int = 49153
 
@@ -40,13 +46,11 @@ class STTContinuationConfig:
         return int(round(self.text_delay_seconds * self.frame_rate))
 
     @property
-    def continuation_text_delay_steps(self) -> int:
-        return self.text_delay_steps + self.continuation_delay_steps
-
-    @property
     def delays(self) -> list[int]:
-        # Timing offsets do not create cross-channel text conditioning.
-        return [self.text_delay_steps, self.continuation_text_delay_steps, 0] + [
+        # Preserve Moshi's native ordering: its text stream first, followed by
+        # semantic and acoustic audio. User text lags semantic audio so its
+        # prediction can condition on the corresponding observed semantic token.
+        return [self.continuation_delay_steps, self.text_delay_steps, 0] + [
             self.acoustic_delay_steps
         ] * (
             self.num_codebooks - 1
@@ -77,16 +81,21 @@ class SmolLM2MoshiSTTContinuation(LMModel):
     ) -> None:
         if config.text_context_mode != "independent":
             raise ValueError("This model requires independent text contexts")
+        if config.continuation_delay_steps != 0:
+            raise ValueError(
+                "continuation_delay_steps must be 0 for assistant inner-monologue"
+            )
         temporal_config = AutoConfig.from_pretrained(config.temporal_model)
         dim = int(temporal_config.hidden_size)
         self.stt_continuation_config = config
 
-        # Keep Moshi's stream embeddings and delay metadata, but disable the
-        # audio Depformer: Mimi codes are conditioning inputs, not targets.
+        # Keep Moshi's native Temporal -> Depth Transformer training path. The
+        # only structural extension is a second text stream in the Temporal
+        # backbone.
         super().__init__(
             delays=config.delays,
             n_q=config.num_codebooks,
-            dep_q=0,
+            dep_q=config.num_codebooks,
             card=config.audio_card,
             text_card=config.text_card,
             dim=dim,
@@ -97,18 +106,22 @@ class SmolLM2MoshiSTTContinuation(LMModel):
             causal=True,
             context=config.context,
             existing_text_padding_id=config.text_padding_id,
+            depformer_dim=config.depformer_dim,
+            depformer_dim_feedforward=config.depformer_ffn_dim,
+            depformer_num_heads=config.depformer_heads,
+            depformer_num_layers=config.depformer_layers,
+            depformer_context=config.num_codebooks,
+            depformer_gating="silu",
+            depformer_pos_emb="none",
+            depformer_multi_linear=True,
+            depformer_weights_per_step=True,
             device=device,
             dtype=dtype,
         )
-        # LMModel allocates a projection even with dep_q=0; it is unreachable
-        # in text-only training/inference, so do not retain it in the model or
-        # checkpoints.
-        del self.depformer_in
-
-        # LMModel owns the ASR text embedding/head. Add a second independent
-        # text stream for continuation while retaining the same vocabulary.
-        self.continuation_text_emb = copy.deepcopy(self.text_emb)
-        self.continuation_text_linear = nn.Linear(
+        # LMModel's native text stream is assistant text. Add independent user
+        # text input/output modules with the same vocabulary.
+        self.user_text_emb = copy.deepcopy(self.text_emb)
+        self.user_text_linear = nn.Linear(
             dim,
             config.text_card,
             bias=self.text_linear.bias is not None,
@@ -145,8 +158,8 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         count = min(source.shape[0], self.text_emb.weight.shape[0])
         with torch.no_grad():
             self.text_emb.weight[:count].copy_(source[:count].to(self.text_emb.weight))
-            self.continuation_text_emb.weight[:count].copy_(
-                source[:count].to(self.continuation_text_emb.weight)
+            self.user_text_emb.weight[:count].copy_(
+                source[:count].to(self.user_text_emb.weight)
             )
 
     def forward_text(
@@ -162,9 +175,9 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
 
-        asr_hidden = self.text_emb(sequence[:, 0])
-        continuation_hidden = self.continuation_text_emb(sequence[:, 1])
-        audio_hidden = torch.zeros_like(asr_hidden)
+        assistant_hidden = self.text_emb(sequence[:, 0])
+        user_hidden = self.user_text_emb(sequence[:, 1])
+        audio_hidden = torch.zeros_like(assistant_hidden)
         for index, embedding in enumerate(self.emb):
             audio_hidden = audio_hidden + embedding(sequence[:, index + self.audio_offset])
         if sum_condition is not None:
@@ -172,7 +185,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
 
         # Separate batch rows have separate attention histories, while sharing
         # Transformer weights. Neither branch receives the other text channel.
-        hidden = torch.cat([asr_hidden + audio_hidden, continuation_hidden + audio_hidden], dim=0)
+        hidden = torch.cat([assistant_hidden + audio_hidden, user_hidden + audio_hidden], dim=0)
         audio_mask = (sequence[:, self.audio_offset:] != self.zero_token_id).any(dim=1)
         attention_mask = torch.cat([
             audio_mask | (sequence[:, 0] != self.zero_token_id),
@@ -184,46 +197,82 @@ class SmolLM2MoshiSTTContinuation(LMModel):
             use_cache=False,
             return_dict=True,
         )
-        asr_state, continuation_state = output.last_hidden_state.chunk(2, dim=0)
-        temporal_hidden = torch.stack([asr_state, continuation_state], dim=1)
-        asr_logits = self.text_linear(asr_state)
-        continuation_logits = self.continuation_text_linear(continuation_state)
-        return temporal_hidden, torch.stack([asr_logits, continuation_logits], dim=1)
+        assistant_state, user_state = output.last_hidden_state.chunk(2, dim=0)
+        temporal_hidden = torch.stack([assistant_state, user_state], dim=1)
+        assistant_logits = self.text_linear(assistant_state)
+        user_logits = self.user_text_linear(user_state)
+        return temporal_hidden, torch.stack([assistant_logits, user_logits], dim=1)
+
+    def forward_user_audio_training(
+        self, sequence: torch.Tensor, user_state: torch.Tensor
+    ) -> torch.Tensor:
+        """Predict user Mimi codebooks with the Depth Transformer."""
+        assert self.depformer_text_emb is not None
+        assert self.depformer_emb is not None
+        assert self.depformer is not None
+        batch, _, frames = sequence.shape
+        inputs = []
+        for codebook in range(self.dep_q):
+            # moshi_tts uses one Temporal projection per Depth step.
+            temporal = self.depformer_in[codebook](user_state)
+            if codebook == 0:
+                token = self.depformer_text_emb(sequence[:, 1])
+            else:
+                token = self.depformer_emb[codebook - 1](
+                    sequence[:, self.audio_offset + codebook - 1]
+                )
+            inputs.append(token + temporal)
+        depth_input = torch.stack(inputs, dim=2).view(batch * frames, self.dep_q, -1)
+        depth_output = self.depformer(depth_input)
+        logits = [
+            self.linears[q](self.depformer_norms[q](depth_output[:, q])).view(batch, frames, -1)
+            for q in range(self.dep_q)
+        ]
+        return torch.stack(logits, dim=1)
 
     def checkpoint_metadata(self) -> dict[str, object]:
         return asdict(self.stt_continuation_config)
 
-    def forward_text_training(
+    def forward_training(
         self, streams: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply stream delays and predict both text channels."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Predict assistant text, user text, and user Mimi audio."""
         batch, codebooks, _ = streams.shape
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
         initial = self._get_initial_token().expand(batch, -1, -1)
         delayed = _delay_sequence(self.delays, streams, initial)
         delayed = torch.cat([initial, delayed], dim=2)
-        _, text_logits = self.forward_text(delayed[:, :, :-1])
+        temporal, text_logits = self.forward_text(delayed[:, :, :-1])
+        audio_logits = self.forward_user_audio_training(delayed[:, :, 1:], temporal[:, 1])
         text_logits, text_mask = _undelay_sequence(
             self.delays[: self.num_text_streams], text_logits, fill_value=float("nan")
         )
         text_mask &= streams[:, : self.num_text_streams] != self.zero_token_id
-        return text_logits, text_mask
+        audio_logits, audio_mask = _undelay_sequence(
+            self.delays[self.audio_offset:], audio_logits, fill_value=float("nan")
+        )
+        audio_mask &= streams[:, self.audio_offset:] != self.zero_token_id
+        return text_logits, text_mask, audio_logits, audio_mask
 
 
-def masked_text_continuation_loss(
+def masked_multistream_loss(
     text_logits: torch.Tensor,
     text_mask: torch.Tensor,
     streams: torch.Tensor,
     *,
     text_padding_id: int | None = None,
     text_padding_weight: float = 0.5,
+    audio_logits: torch.Tensor | None = None,
+    audio_mask: torch.Tensor | None = None,
+    audio_loss_weight: float = 1.0,
+    semantic_loss_weight: float = 100.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute independent ASR and continuation CE losses."""
     text_targets = streams[:, :2]
     channel_losses = []
     metrics: dict[str, torch.Tensor] = {}
-    for channel, name in enumerate(("asr", "continuation")):
+    for channel, name in enumerate(("assistant", "user")):
         mask = text_mask[:, channel]
         logits = text_logits[:, channel][mask].float()
         targets = text_targets[:, channel][mask]
@@ -253,6 +302,28 @@ def masked_text_continuation_loss(
         metrics[f"{name}/accuracy"] = (predictions == targets).float().mean().detach()
         metrics[f"{name}/non_pad_accuracy"] = non_pad_accuracy.detach()
 
-    total = torch.stack(channel_losses).mean()
+    text_loss = torch.stack(channel_losses).mean()
+    total = text_loss
+    if audio_logits is not None and audio_mask is not None:
+        audio_targets = streams[:, 2:]
+        per_codebook = []
+        accuracies = []
+        for codebook in range(audio_logits.shape[1]):
+            mask = audio_mask[:, codebook]
+            logits = audio_logits[:, codebook][mask].float()
+            targets = audio_targets[:, codebook][mask]
+            codebook_loss = nn.functional.cross_entropy(logits, targets)
+            per_codebook.append(codebook_loss)
+            accuracy = (logits.argmax(dim=-1) == targets).float().mean()
+            accuracies.append(accuracy)
+            metrics[f"user_audio/rq/{codebook}_loss"] = codebook_loss.detach()
+            metrics[f"user_audio/rq/{codebook}_accuracy"] = accuracy.detach()
+        weights = audio_logits.new_ones(len(per_codebook), dtype=torch.float32)
+        weights[0] = semantic_loss_weight
+        audio_loss = (torch.stack(per_codebook) * weights).sum() / weights.sum()
+        audio_accuracy = torch.stack(accuracies).mean()
+        total = text_loss + audio_loss_weight * audio_loss
+        metrics["loss/user_audio"] = audio_loss.detach()
+        metrics["user_audio/accuracy"] = audio_accuracy.detach()
     metrics["loss/total"] = total.detach()
     return total, metrics
