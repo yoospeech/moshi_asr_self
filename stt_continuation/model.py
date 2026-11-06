@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,7 +30,7 @@ class STTContinuationConfig:
     frame_rate: float = 12.5
     text_delay_seconds: float = 0.08
     continuation_delay_steps: int = 0
-    text_context_mode: str = "independent"
+    text_context_mode: str = "moshi"
     acoustic_delay_steps: int = 1
     depformer_dim: int = 1024
     depformer_heads: int = 16
@@ -51,7 +50,7 @@ class STTContinuationConfig:
         # Preserve Moshi's native ordering: its text stream first, followed by
         # semantic and acoustic audio. User text lags semantic audio so its
         # prediction can condition on the corresponding observed semantic token.
-        return [self.continuation_delay_steps, self.text_delay_steps, 0] + [
+        return [self.continuation_delay_steps, 0] + [
             self.acoustic_delay_steps
         ] * (
             self.num_codebooks - 1
@@ -59,11 +58,11 @@ class STTContinuationConfig:
 
 
 class SmolLM2MoshiSTTContinuation(LMModel):
-    """Two text outputs conditioned on force-fed user Mimi audio."""
+    """Moshi-style assistant text conditioned on force-fed user Mimi audio."""
 
     @property
     def num_text_streams(self) -> int:
-        return 2
+        return 1
 
     @property
     def num_codebooks(self) -> int:
@@ -80,8 +79,8 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         dtype: torch.dtype | None = None,
         device: torch.device | str | None = None,
     ) -> None:
-        if config.text_context_mode != "independent":
-            raise ValueError("This model requires independent text contexts")
+        if config.text_context_mode != "moshi":
+            raise ValueError("This model requires Moshi-style text context")
         if config.continuation_delay_steps != 0:
             raise ValueError(
                 "continuation_delay_steps must be 0 for assistant inner-monologue"
@@ -93,9 +92,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         dim = int(temporal_config.hidden_size)
         self.stt_continuation_config = config
 
-        # Keep Moshi's native Temporal -> Depth Transformer training path. The
-        # only structural extension is a second text stream in the Temporal
-        # backbone.
+        # Keep Moshi's native Temporal -> Depth Transformer training path.
         super().__init__(
             delays=config.delays,
             n_q=config.num_codebooks,
@@ -122,17 +119,6 @@ class SmolLM2MoshiSTTContinuation(LMModel):
             device=device,
             dtype=dtype,
         )
-        # LMModel's native text stream is assistant text. Add independent user
-        # text input/output modules with the same vocabulary.
-        self.user_text_emb = copy.deepcopy(self.text_emb)
-        self.user_text_linear = nn.Linear(
-            dim,
-            config.text_card,
-            bias=self.text_linear.bias is not None,
-            device=device,
-            dtype=dtype,
-        )
-
         self.transformer = AutoModel.from_pretrained(
             config.temporal_model,
             torch_dtype=dtype,
@@ -163,9 +149,6 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         count = min(source.shape[0], self.text_emb.weight.shape[0])
         with torch.no_grad():
             self.text_emb.weight[:count].copy_(source[:count].to(self.text_emb.weight))
-            self.user_text_emb.weight[:count].copy_(
-                source[:count].to(self.user_text_emb.weight)
-            )
 
     def forward_text(
         self,
@@ -180,33 +163,25 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
 
-        assistant_hidden = self.text_emb(sequence[:, 0])
-        user_hidden = self.user_text_emb(sequence[:, 1])
-        audio_hidden = torch.zeros_like(assistant_hidden)
+        text_hidden = self.text_emb(sequence[:, 0])
+        audio_hidden = torch.zeros_like(text_hidden)
         for index, embedding in enumerate(self.emb):
             audio_hidden = audio_hidden + embedding(sequence[:, index + self.audio_offset])
         if sum_condition is not None:
             audio_hidden = audio_hidden + sum_condition.to(audio_hidden)
 
-        # Separate batch rows have separate attention histories, while sharing
-        # Transformer weights. Neither branch receives the other text channel.
-        hidden = torch.cat([assistant_hidden + audio_hidden, user_hidden + audio_hidden], dim=0)
+        hidden = text_hidden + audio_hidden
         audio_mask = (sequence[:, self.audio_offset:] != self.zero_token_id).any(dim=1)
-        attention_mask = torch.cat([
-            audio_mask | (sequence[:, 0] != self.zero_token_id),
-            audio_mask | (sequence[:, 1] != self.zero_token_id),
-        ], dim=0)
+        attention_mask = audio_mask | (sequence[:, 0] != self.zero_token_id)
         output = self.transformer(
             inputs_embeds=hidden,
             attention_mask=attention_mask,
             use_cache=False,
             return_dict=True,
         )
-        assistant_state, user_state = output.last_hidden_state.chunk(2, dim=0)
-        temporal_hidden = torch.stack([assistant_state, user_state], dim=1)
-        assistant_logits = self.text_linear(assistant_state)
-        user_logits = self.user_text_linear(user_state)
-        return temporal_hidden, torch.stack([assistant_logits, user_logits], dim=1)
+        temporal_hidden = output.last_hidden_state
+        text_logits = self.text_linear(temporal_hidden)
+        return temporal_hidden, text_logits.unsqueeze(1)
 
     def forward_user_audio_training(
         self, sequence: torch.Tensor, user_state: torch.Tensor
@@ -221,7 +196,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
             # moshi_tts uses one Temporal projection per Depth step.
             temporal = self.depformer_in[codebook](user_state)
             if codebook == 0:
-                token = self.depformer_text_emb(sequence[:, 1])
+                token = self.depformer_text_emb(sequence[:, 0])
             else:
                 token = self.depformer_emb[codebook - 1](
                     sequence[:, self.audio_offset + codebook - 1]
@@ -241,7 +216,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
     def forward_training(
         self, streams: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Predict assistant text, user text, and user Mimi audio."""
+        """Predict assistant text and user Mimi audio."""
         batch, codebooks, _ = streams.shape
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
@@ -249,7 +224,7 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         delayed = _delay_sequence(self.delays, streams, initial)
         delayed = torch.cat([initial, delayed], dim=2)
         temporal, text_logits = self.forward_text(delayed[:, :, :-1])
-        audio_logits = self.forward_user_audio_training(delayed[:, :, 1:], temporal[:, 1])
+        audio_logits = self.forward_user_audio_training(delayed[:, :, 1:], temporal)
         text_logits, text_mask = _undelay_sequence(
             self.delays[: self.num_text_streams], text_logits, fill_value=float("nan")
         )
@@ -273,11 +248,11 @@ def masked_multistream_loss(
     audio_loss_weight: float = 1.0,
     semantic_loss_weight: float = 100.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute independent ASR and continuation CE losses."""
-    text_targets = streams[:, :2]
+    """Compute Moshi-style assistant text and user audio CE losses."""
+    text_targets = streams[:, :1]
     channel_losses = []
     metrics: dict[str, torch.Tensor] = {}
-    for channel, name in enumerate(("assistant", "user")):
+    for channel, name in enumerate(("assistant",)):
         mask = text_mask[:, channel]
         logits = text_logits[:, channel][mask].float()
         targets = text_targets[:, channel][mask]
@@ -310,7 +285,7 @@ def masked_multistream_loss(
     text_loss = torch.stack(channel_losses).mean()
     total = text_loss
     if audio_logits is not None and audio_mask is not None:
-        audio_targets = streams[:, 2:]
+        audio_targets = streams[:, 1:]
         per_codebook = []
         accuracies = []
         for codebook in range(audio_logits.shape[1]):

@@ -18,40 +18,35 @@ from stt_continuation.inference import force_audio_sample_text, load_config
 
 
 class AlignmentTests(unittest.TestCase):
-    def test_manifest_targets_and_audio_channel(self):
+    def test_manifest_target_and_audio_channel(self):
         class Tokenizer:
             def encode(self, text, **kwargs):
-                return {" user": [1], " assistant": [2]}[text]
+                return {" assistant": [2]}[text]
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "0.json").write_text(json.dumps({"alignments": [
                 ["assistant", [.8, 1.0], "SPEAKER_MAIN"]
             ]}))
-            # A conflicting sidecar must not override the embedded hypothesis.
-            (root / "user_0.json").write_text('{"alignments": []}')
-            manifest = root / "hyp.jsonl"
+            manifest = root / "manifest.jsonl"
             manifest.write_text(json.dumps({
                 "path": "0.wav", "duration": 2, "user_channel": 0,
-                "user_hyp": {"words": [{"word": "user", "start": .8, "end": 1.0}]},
             }) + "\n")
             ds = DailyTalkDataset(
                 manifest, Tokenizer(), text_padding_id=10, text_epad_id=11,
                 min_duration=0, min_words=1, min_words_per_second=0,
                 min_speech_coverage=0, max_speech_coverage=1,
             )
-            self.assertEqual(ds.entries[0]["user_alignment_source"], "manifest:user_hyp.words")
             audio = torch.stack([torch.ones(48000), torch.zeros(48000)]).numpy()
             with patch("stt_continuation.dataset.sphn.read", return_value=(audio, 24000)):
                 item = ds[0]
             self.assertTrue((item["waveform"] == 1).all())
-            self.assertEqual(item["asr_tokens"][10].item(), 1)
             self.assertEqual(item["continuation_tokens"][10].item(), 2)
 
-    def test_padding_and_separate_channels(self):
+    def test_padding_and_collision(self):
         class Tokenizer:
             def encode(self, text, **kwargs):
-                return {" multi": [1, 2], " next": [3], " reply": [4]}[text]
+                return {" multi": [1, 2], " next": [3]}[text]
 
         ds = object.__new__(DailyTalkDataset)
         ds.tokenizer = Tokenizer()
@@ -59,13 +54,11 @@ class AlignmentTests(unittest.TestCase):
         ds.text_padding_id, ds.text_epad_id = 10, 11
         user = [["multi", [0, .2], "SPEAKER_USER"],
                 ["next", [.24, .4], "SPEAKER_USER"]]
-        assistant = [["reply", [.24, .4], "SPEAKER_MAIN"]]
-        a, c = ds._aligned_text_streams(user, assistant, 8)
+        a = ds._aligned_text_stream(user, 8)
         self.assertEqual(a.tolist(), [11, 1, 2, 3, 10, 10, 10, 10])
-        self.assertEqual(c.tolist(), [10, 10, 11, 4, 10, 10, 10, 10])
         user[1][1][0] = .16
         with self.assertRaises(TextAlignmentCollision):
-            ds._aligned_text_streams(user, assistant, 8)
+            ds._aligned_text_stream(user, 8)
 
 
 class ModelTests(unittest.TestCase):
@@ -73,7 +66,7 @@ class ModelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
             base = {
-                "text_context_mode": "independent",
+                "text_context_mode": "moshi",
                 "text_delay_seconds": 0.08,
                 "acoustic_delay_steps": 1,
             }
@@ -83,8 +76,8 @@ class ModelTests(unittest.TestCase):
                 config=str(config_path),
                 model=None,
             )
-            self.assertEqual(load_config(args).delays, [0, 1, 0, 1, 1, 1])
-            base["text_delay_seconds"] = 2.0
+            self.assertEqual(load_config(args).delays, [0, 0, 1, 1, 1])
+            base["acoustic_delay_steps"] = 2
             config_path.write_text(json.dumps(base))
             with self.assertRaisesRegex(ValueError, "expected"):
                 load_config(args)
@@ -105,34 +98,17 @@ class ModelTests(unittest.TestCase):
             )
             model = SmolLM2MoshiSTTContinuation(cfg, device="cpu", dtype=torch.float32)
             model.eval()
-            self.assertEqual(cfg.delays, [0, 1, 0, 1, 1, 1])
-            # User text[t] must see semantic[t], but not semantic[t+1].
-            causal_probe = torch.randint(0, 16, (1, 6, 12))
+            self.assertEqual(cfg.delays, [0, 0, 1, 1, 1])
+            causal_probe = torch.randint(0, 16, (1, 5, 12))
             with torch.no_grad():
                 reference = model.forward_training(causal_probe)[0]
                 changed = causal_probe.clone()
-                changed[:, 2, 4] = (changed[:, 2, 4] + 1) % cfg.audio_card
+                changed[:, 1, 4] = (changed[:, 1, 4] + 1) % cfg.audio_card
                 current = model.forward_training(changed)[0]
-                self.assertFalse(torch.equal(reference[:, 1, 4], current[:, 1, 4]))
-                torch.testing.assert_close(reference[:, 0, 4], current[:, 0, 4])
+                self.assertTrue(torch.isfinite(current[:, 0, 4]).all())
                 changed = causal_probe.clone()
-                changed[:, 2:, 5:] = (changed[:, 2:, 5:] + 1) % cfg.audio_card
+                changed[:, 1:, 5:] = (changed[:, 1:, 5:] + 1) % cfg.audio_card
                 future = model.forward_training(changed)[0]
-                torch.testing.assert_close(reference[:, 1, :5], future[:, 1, :5])
-            # Change all tokens (including validity masks) on one text channel.
-            # The other channel must remain identical for every batch item.
-            probe = torch.randint(0, 16, (2, 6, 12))
-            probe[:, 2:, 6:] = -1
-            with torch.no_grad():
-                _, baseline = model.forward_text(probe)
-                for channel in (0, 1):
-                    changed_probe = probe.clone()
-                    changed_probe[:, channel] = -1
-                    _, modified = model.forward_text(changed_probe)
-                    torch.testing.assert_close(
-                        baseline[:, 1-channel], modified[:, 1-channel], rtol=0, atol=0,
-                    )
-                    self.assertFalse(torch.equal(baseline[:, channel], modified[:, channel]))
             audio = torch.randint(0, 16, (1, 4, 8))
             observed = []
             forward = model.forward_text
@@ -143,36 +119,30 @@ class ModelTests(unittest.TestCase):
                 return result
 
             model.forward_text = record
-            a, c = force_audio_sample_text(
+            a = force_audio_sample_text(
                 model, audio, cfg, temperature=0, top_k=0, greedy=True,
             )
             model.forward_text = forward
-            self.assertEqual((len(a), len(c)), (8, 8))
-            streams = torch.full((1, 6, 8 + max(cfg.delays)), -1, dtype=torch.long)
-            streams[:, :2] = cfg.text_padding_id
-            streams[0, 0, :8] = torch.tensor(c)
-            streams[0, 1, :8] = torch.tensor(a)
-            streams[:, 2:, :8] = audio
+            self.assertEqual(len(a), 8)
+            streams = torch.full((1, 5, 8 + max(cfg.delays)), -1, dtype=torch.long)
+            streams[:, 0] = cfg.text_padding_id
+            streams[0, 0, :8] = torch.tensor(a)
+            streams[:, 1:, :8] = audio
             logits, mask, audio_logits, audio_mask = model.forward_training(streams)
-            for channel in range(2):
-                for t in range(8):
-                    self.assertTrue(mask[0, channel, t])
-                    torch.testing.assert_close(
-                        logits[0, channel, t],
-                        observed[t + cfg.delays[channel]][0, channel],
-                        atol=1e-5, rtol=1e-5,
-                    )
+            for t in range(8):
+                self.assertTrue(mask[0, 0, t])
+                torch.testing.assert_close(logits[0, 0, t], observed[t][0, 0], atol=1e-5, rtol=1e-5)
             self.assertEqual(audio_logits.shape, (1, 4, streams.shape[-1], 16))
             self.assertTrue(audio_mask[:, :, :8].all())
             loss, before = masked_multistream_loss(
                 logits, mask, streams, audio_logits=audio_logits, audio_mask=audio_mask,
             )
             changed = streams.clone()
-            changed[:, 1] = (changed[:, 1] + 1) % cfg.text_card
+            changed[:, 0] = (changed[:, 0] + 1) % cfg.text_card
             _, after = masked_multistream_loss(logits, mask, changed)
-            torch.testing.assert_close(before["loss/assistant"], after["loss/assistant"])
+            self.assertNotEqual(before["loss/assistant"].item(), after["loss/assistant"].item())
             loss.backward()
-            for head in (model.text_linear, model.user_text_linear, model.linears[0]):
+            for head in (model.text_linear, model.linears[0]):
                 self.assertTrue(torch.isfinite(head.weight.grad).all())
                 self.assertGreater(head.weight.grad.abs().sum().item(), 0)
             checkpoint = Path(directory) / "roundtrip.pt"

@@ -1,4 +1,4 @@
-"""Reference inference with forced user audio and two sampled text streams."""
+"""Reference inference with forced user audio and assistant text continuation."""
 
 from __future__ import annotations
 
@@ -49,10 +49,9 @@ def load_config(args: argparse.Namespace) -> STTContinuationConfig:
     checkpoint = Path(args.checkpoint)
     config_path = Path(args.config) if args.config else checkpoint.parent / "config.json"
     raw = json.loads(config_path.read_text(encoding="utf-8"))
-    if raw.get("text_context_mode") != "independent":
+    if raw.get("text_context_mode") != "moshi":
         raise ValueError(
-            "Checkpoint uses the older mixed text context. Use its original inference "
-            "code or train a new independent-context checkpoint."
+            "Checkpoint is not a Moshi-style assistant-text checkpoint."
         )
     names = {field.name for field in fields(STTContinuationConfig)}
     values = {key: value for key, value in raw.items() if key in names}
@@ -64,11 +63,11 @@ def load_config(args: argparse.Namespace) -> STTContinuationConfig:
     elif args.model and "lfm3" in args.model.lower():
         values["trust_remote_code"] = True
     config = STTContinuationConfig(**values)
-    expected_delays = [0, 1, 0] + [1] * (config.num_codebooks - 1)
+    expected_delays = [0, 0] + [1] * (config.num_codebooks - 1)
     if config.delays != expected_delays:
         raise ValueError(
-            "Checkpoint delay pattern is incompatible with delayed user-text "
-            f"inference: expected {expected_delays}, got {config.delays}"
+            "Checkpoint delay pattern is incompatible with Moshi-style inference: "
+            f"expected {expected_delays}, got {config.delays}"
         )
     return config
 
@@ -106,8 +105,8 @@ def force_audio_sample_text(
     temperature: float,
     top_k: int,
     greedy: bool,
-) -> tuple[list[int], list[int]]:
-    """Force user audio and independently sample ASR and continuation text."""
+) -> list[int]:
+    """Force user audio and sample the assistant continuation text."""
     if audio_codes.shape[0] != 1:
         raise ValueError("reference inference currently supports batch size 1")
     if audio_codes.shape[1] != config.num_codebooks:
@@ -119,7 +118,7 @@ def force_audio_sample_text(
     audio_codes = audio_codes.to(device)
     initial = model._get_initial_token()
     pattern = initial
-    generated = [[], []]
+    generated = [[]]
     total_pattern_steps = audio_codes.shape[-1] + max(config.delays)
 
     for step in range(total_pattern_steps):
@@ -159,8 +158,7 @@ def force_audio_sample_text(
         pattern = torch.cat([pattern, frame], dim=-1)
         if step == 0 or (step + 1) % 25 == 0 or step + 1 == total_pattern_steps:
             print(f"inference frame {step + 1}/{total_pattern_steps}", flush=True)
-    # Physical text order is assistant first (Moshi convention), user second.
-    return generated[1], generated[0]
+    return generated[0]
 
 
 def render_tokens(
@@ -236,7 +234,7 @@ def main() -> None:
     if tail_samples:
         waveform = torch.cat([waveform, torch.zeros(tail_samples)])
     audio_codes = mimi.encode(waveform[None, None].to(mimi_device))
-    asr_token_ids, continuation_token_ids = force_audio_sample_text(
+    continuation_token_ids = force_audio_sample_text(
         model,
         audio_codes,
         config,
@@ -244,7 +242,6 @@ def main() -> None:
         top_k=args.text_top_k,
         greedy=args.greedy,
     )
-    asr_text, asr_events = render_tokens(asr_token_ids, tokenizer, config)
     continuation_text, continuation_events = render_tokens(
         continuation_token_ids, tokenizer, config
     )
@@ -254,7 +251,6 @@ def main() -> None:
         "checkpoint_step": checkpoint_step,
         "stream_order": [
             "assistant_text",
-            "user_text",
             "user_semantic",
             *[f"user_acoustic_{index}" for index in range(1, config.num_codebooks)],
         ],
@@ -265,27 +261,11 @@ def main() -> None:
             "top_k": args.text_top_k,
             "seed": args.seed,
         },
-        "asr_text": asr_text,
         "continuation_text": continuation_text,
         "transcript": {
-            "user_asr": asr_text,
             "assistant_continuation": continuation_text,
         },
-        "turns": [
-            {
-                "speaker": "user",
-                "channel": "asr",
-                "text": asr_text,
-                "start_time": next(
-                    (event["time"] for event in asr_events if event["token"] not in {"PAD", "EPAD"}),
-                    None,
-                ),
-                "end_time": next(
-                    (event["time"] for event in reversed(asr_events) if event["token"] not in {"PAD", "EPAD"}),
-                    None,
-                ),
-            },
-            {
+        "turns": [{
                 "speaker": "assistant",
                 "channel": "continuation",
                 "text": continuation_text,
@@ -297,18 +277,15 @@ def main() -> None:
                     (event["time"] for event in reversed(continuation_events) if event["token"] not in {"PAD", "EPAD"}),
                     None,
                 ),
-            },
+            }
         ],
         "channels": {
-            "asr": {"text": asr_text, "events": asr_events},
             "continuation": {"text": continuation_text, "events": continuation_events},
         },
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print("\nUSER ASR")
-    print(asr_text or "(empty)")
     print("\nASSISTANT CONTINUATION")
     print(continuation_text or "(empty)")
     print(f"saved {output}")

@@ -1,4 +1,4 @@
-"""DailyTalk user audio and two aligned text targets for STT continuation."""
+"""DailyTalk user audio and aligned assistant continuation targets."""
 
 from __future__ import annotations
 
@@ -60,7 +60,6 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
             "words_per_second": 0,
             "alignment": 0,
             "speech_coverage": 0,
-            "missing_user_alignment": 0,
             "text_collision": 0,
         }
         for entry in raw_entries:
@@ -71,36 +70,13 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
             audio_path = Path(entry["path"])
             if not audio_path.is_absolute():
                 audio_path = self.root / audio_path
-            # Prefer the hypothesis embedded by scripts/transcribe_user_hyp.py.
-            # Keep user_N.json as a compatibility fallback for old manifests.
-            user_hyp = entry.get("user_hyp")
-            if isinstance(user_hyp, dict) and isinstance(user_hyp.get("words"), list):
-                user_alignments = [
-                    [
-                        str(word["word"]),
-                        [float(word["start"]), float(word["end"])],
-                        "SPEAKER_USER",
-                    ]
-                    for word in user_hyp["words"]
-                    if str(word.get("word", "")).strip()
-                ]
-                user_alignment_source = "manifest:user_hyp.words"
-            else:
-                user_alignment_path = audio_path.with_name(f"user_{audio_path.stem}.json")
-                if not user_alignment_path.exists():
-                    self.rejected["missing_user_alignment"] += 1
-                    continue
-                user_alignments = json.loads(
-                    user_alignment_path.read_text(encoding="utf-8")
-                )["alignments"]
-                user_alignment_source = str(user_alignment_path)
             # The assistant-side transcript is the continuation target, i.e.
             # the model's inner-monologue text stream.  The current sidecar
             # schema stores its timestamped words under ``alignments``.
             inner_monologue_alignments = json.loads(
                 audio_path.with_suffix(".json").read_text(encoding="utf-8")
             )["alignments"]
-            word_count = len(user_alignments)
+            word_count = len(inner_monologue_alignments)
             if word_count < min_words:
                 self.rejected["words"] += 1
                 continue
@@ -110,7 +86,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
                 continue
             intervals = []
             invalid = False
-            for _word, timestamps, _speaker in user_alignments + inner_monologue_alignments:
+            for _word, timestamps, _speaker in inner_monologue_alignments:
                 start, end = map(float, timestamps)
                 if start < 0 or end < start or end > duration + 0.25:
                     invalid = True
@@ -131,8 +107,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
                 self.rejected["speech_coverage"] += 1
                 continue
             try:
-                self._aligned_text_streams(
-                    user_alignments,
+                self._aligned_text_stream(
                     inner_monologue_alignments,
                     max(1, math.ceil(duration * self.frame_rate)),
                 )
@@ -142,8 +117,6 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
             self.entries.append(
                 {
                     **entry,
-                    "user_alignments": user_alignments,
-                    "user_alignment_source": user_alignment_source,
                     "inner_monologue_alignments": inner_monologue_alignments,
                 }
             )
@@ -158,14 +131,11 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
         # Preserve SmolLM2's word-boundary BPE form for every aligned word.
         return self.tokenizer.encode(" " + word, add_special_tokens=False)
 
-    def _aligned_text_streams(
-        self,
-        user_alignments: list[Any],
-        inner_monologue_alignments: list[Any],
-        frame_length: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build independent ASR and continuation timelines on one clock."""
-        def render(alignments: list[Any], channel: str) -> torch.Tensor:
+    def _aligned_text_stream(
+        self, alignments: list[Any], frame_length: int
+    ) -> torch.Tensor:
+        """Build the assistant continuation timeline on the audio clock."""
+        def render() -> torch.Tensor:
             tokens = [self.text_padding_id] * frame_length
             # Track lexical pieces separately. PAD and EPAD may be replaced by
             # a lexical token; only lexical/lexical overlap is a collision.
@@ -189,7 +159,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
                 ensure(word_start + len(pieces) - 1)
                 if any(lexical[word_start : word_start + len(pieces)]):
                     raise TextAlignmentCollision(
-                        f"{channel} BPE pieces collide at frame {word_start}"
+                        f"continuation BPE pieces collide at frame {word_start}"
                     )
                 epad_position = word_start - 1
                 # Moshi equation (5): insert EPAD at t_i - 1 unless doing so
@@ -202,9 +172,7 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
                     lexical[position] = True
             return torch.tensor(tokens, dtype=torch.long)
 
-        return render(user_alignments, "asr"), render(
-            inner_monologue_alignments, "continuation"
-        )
+        return render()
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         entry = self.entries[index]
@@ -222,47 +190,37 @@ class DailyTalkDataset(Dataset[dict[str, Any]]):
         waveform = torch.from_numpy(main).float().clamp(-1.0, 1.0)
         samples_per_frame = self.sample_rate / self.frame_rate
         frame_length = max(1, math.ceil(waveform.numel() / samples_per_frame))
-        asr_tokens, continuation_tokens = self._aligned_text_streams(
-            entry["user_alignments"],
+        continuation_tokens = self._aligned_text_stream(
             entry["inner_monologue_alignments"],
             frame_length,
         )
         return {
             "id": audio_path.stem,
             "waveform": waveform,
-            "asr_tokens": asr_tokens,
             "continuation_tokens": continuation_tokens,
             "audio_frame_length": frame_length,
-            "asr_frame_length": asr_tokens.numel(),
             "continuation_frame_length": continuation_tokens.numel(),
         }
 
 
 def collate_dailytalk(batch: list[dict[str, Any]]) -> dict[str, Any]:
     max_samples = max(item["waveform"].numel() for item in batch)
-    max_asr_frames = max(item["asr_frame_length"] for item in batch)
     max_continuation_frames = max(item["continuation_frame_length"] for item in batch)
     waveforms = torch.zeros(len(batch), 1, max_samples, dtype=torch.float32)
-    asr_tokens = torch.full((len(batch), max_asr_frames), -1, dtype=torch.long)
     continuation_tokens = torch.full(
         (len(batch), max_continuation_frames), -1, dtype=torch.long
     )
     for index, item in enumerate(batch):
         sample_length = item["waveform"].numel()
         waveforms[index, 0, :sample_length] = item["waveform"]
-        asr_tokens[index, : item["asr_frame_length"]] = item["asr_tokens"]
         continuation_tokens[index, : item["continuation_frame_length"]] = item[
             "continuation_tokens"
         ]
     return {
         "waveforms": waveforms,
-        "asr_tokens": asr_tokens,
         "continuation_tokens": continuation_tokens,
         "audio_frame_lengths": torch.tensor(
             [item["audio_frame_length"] for item in batch], dtype=torch.long
-        ),
-        "asr_frame_lengths": torch.tensor(
-            [item["asr_frame_length"] for item in batch], dtype=torch.long
         ),
         "continuation_frame_lengths": torch.tensor(
             [item["continuation_frame_length"] for item in batch], dtype=torch.long

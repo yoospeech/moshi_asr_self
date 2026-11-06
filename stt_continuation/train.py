@@ -1,4 +1,4 @@
-"""Train user-only delayed-stream STT continuation with SmolLM2 + Moshi."""
+"""Train user-audio conditioned assistant continuation with Moshi interleaving."""
 
 from __future__ import annotations
 
@@ -53,8 +53,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-codebooks", type=int, default=4)
     parser.add_argument("--audio-card", type=int, default=2048)
     parser.add_argument("--context", type=int, default=3000)
-    parser.add_argument("--text-delay", type=float, default=0.08,
-                        help="user ASR text delay in seconds; default one frame at 12.5 Hz")
     parser.add_argument(
         "--continuation-delay-steps", type=int, default=0,
         help="must remain 0 for assistant inner-monologue timing",
@@ -116,10 +114,10 @@ def print_model_summary(
         f"context={config.context}"
     )
     print(
-        f"  inputs: text=2 audio={config.num_codebooks} card={config.audio_card} "
+        f"  inputs: text=1 audio={config.num_codebooks} card={config.audio_card} "
         f"delays={config.delays}"
     )
-    print("  objective: assistant text + user text + user audio Depth Transformer")
+    print("  objective: assistant text + user audio Depth Transformer")
     for name, count in groups.items():
         print(f"  parameters/{name}: {count / 1e6:.2f}M")
     print(f"  parameters/total: {total / 1e6:.2f}M (trainable {trainable / 1e6:.2f}M)")
@@ -145,12 +143,10 @@ def online_streams(
     config: STTContinuationConfig,
 ) -> torch.Tensor:
     """Extract frozen Mimi codes and combine them with aligned text."""
-    asr_tokens = batch["asr_tokens"].to(device, non_blocking=True)  # type: ignore[union-attr]
     continuation_tokens = batch["continuation_tokens"].to(  # type: ignore[union-attr]
         device, non_blocking=True
     )
     audio_frame_lengths = batch["audio_frame_lengths"].tolist()  # type: ignore[union-attr]
-    asr_frame_lengths = batch["asr_frame_lengths"].tolist()  # type: ignore[union-attr]
     continuation_frame_lengths = batch["continuation_frame_lengths"].tolist()  # type: ignore[union-attr]
     mimi_device = next(mimi.parameters()).device
     waveforms = batch["waveforms"].to(mimi_device, non_blocking=True)  # type: ignore[union-attr]
@@ -162,32 +158,29 @@ def online_streams(
 
     tail = max(config.delays)
     total_frames = max(
-        audio_codes.shape[-1], max(asr_frame_lengths), max(continuation_frame_lengths)
+        audio_codes.shape[-1], max(continuation_frame_lengths)
     ) + tail
     streams = torch.full(
-        (audio_codes.shape[0], 2 + config.num_codebooks, total_frames),
+        (audio_codes.shape[0], 1 + config.num_codebooks, total_frames),
         -1,
         dtype=torch.long,
         device=device,
     )
-    for index, (audio_frames, asr_frames, continuation_frames) in enumerate(
+    for index, (audio_frames, continuation_frames) in enumerate(
         zip(
             audio_frame_lengths,
-            asr_frame_lengths,
             continuation_frame_lengths,
             strict=True,
         )
     ):
         valid_audio_frames = min(audio_frames, audio_codes.shape[-1])
-        streams[index, 1, :asr_frames] = asr_tokens[index, :asr_frames]
-        streams[index, 1, asr_frames : asr_frames + tail] = config.text_padding_id
         streams[index, 0, :continuation_frames] = continuation_tokens[
             index, :continuation_frames
         ]
         streams[
             index, 0, continuation_frames : continuation_frames + tail
         ] = config.text_padding_id
-        streams[index, 2:, :valid_audio_frames] = audio_codes[index, :, :valid_audio_frames]
+        streams[index, 1:, :valid_audio_frames] = audio_codes[index, :, :valid_audio_frames]
     return streams
 
 
@@ -285,7 +278,6 @@ def run_training() -> None:
         audio_card=args.audio_card,
         num_codebooks=args.num_codebooks,
         context=args.context,
-        text_delay_seconds=args.text_delay,
         continuation_delay_steps=args.continuation_delay_steps,
         acoustic_delay_steps=args.acoustic_delay,
         depformer_dim=args.depformer_dim,
@@ -359,7 +351,7 @@ def run_training() -> None:
         # audio-conditioned text loss and backward path without a dataset.
         smoke_frames = max(64, max(config.delays) + 8)
         text = torch.randint(
-            0, config.text_card, (args.batch_size, 2, smoke_frames), device=device
+            0, config.text_card, (args.batch_size, 1, smoke_frames), device=device
         )
         audio = torch.randint(
             0, args.audio_card, (args.batch_size, args.num_codebooks, smoke_frames), device=device
@@ -486,11 +478,10 @@ def run_training() -> None:
                 writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
                 print(
                     f"step={step} loss={metrics['loss/total'].item():.4f} "
-                    f"user_text={metrics['loss/user'].item():.4f} "
                     f"assistant_text={metrics['loss/assistant'].item():.4f} "
                     f"audio={metrics['loss/user_audio'].item():.4f} "
-                    f"user_np={metrics['user/non_pad_accuracy'].item():.3f} "
-                    f"assistant_np={metrics['assistant/non_pad_accuracy'].item():.3f}",
+                    f"assistant_np_accuracy={metrics['assistant/non_pad_accuracy'].item():.3f} "
+                    f"assistant_all_accuracy={metrics['assistant/accuracy'].item():.3f}",
                     flush=True,
                 )
             if primary and not args.smoke_test and step % args.save_every == 0:
@@ -513,8 +504,8 @@ def run_training() -> None:
                     writer.add_scalar(f"valid/{name}", value, step)
                 print(
                     f"valid step={step} loss={valid_metrics['loss/total']:.4f} "
-                    f"user_np={valid_metrics['user/non_pad_accuracy']:.3f} "
-                    f"assistant_np={valid_metrics['assistant/non_pad_accuracy']:.3f} "
+                    f"assistant_np_accuracy={valid_metrics['assistant/non_pad_accuracy']:.3f} "
+                    f"assistant_all_accuracy={valid_metrics['assistant/accuracy']:.3f} "
                     f"audio_acc={valid_metrics['user_audio/accuracy']:.3f}",
                     flush=True,
                 )
