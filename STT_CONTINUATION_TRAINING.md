@@ -49,9 +49,9 @@ torchrun. `--batch-size` is per rank and `--steps` counts microbatches.
 EPAD targets remain at 1.0. Non-PAD targets therefore contribute twice as
 much per frame. This affects text loss only and does not redefine accuracy.
 
-The recommended objective weights are `--text-loss-weight 10.0` and
-`--audio-loss-weight 1.0`, giving assistant continuation text priority while
-retaining Depth Transformer audio prediction as an auxiliary task.
+The default objective weights are `--text-loss-weight 1.0` and
+`--audio-loss-weight 1.0`. PAD/non-PAD balancing is handled separately by
+`--text-padding-weight`.
 
 Deterministic train/validation indices are saved to `OUTPUT/split.json`.
 TensorBoard events are saved to `OUTPUT/tensorboard`.

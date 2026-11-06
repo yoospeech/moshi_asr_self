@@ -37,7 +37,7 @@ class STTContinuationConfig:
     depformer_layers: int = 6
     depformer_ffn_dim: int = 4096
     audio_loss_weight: float = 1.0
-    text_loss_weight: float = 10.0
+    text_loss_weight: float = 1.0
     semantic_loss_weight: float = 100.0
     text_padding_weight: float = 0.5
     text_padding_id: int = 49152
@@ -248,7 +248,7 @@ def masked_multistream_loss(
     audio_logits: torch.Tensor | None = None,
     audio_mask: torch.Tensor | None = None,
     audio_loss_weight: float = 1.0,
-    text_loss_weight: float = 10.0,
+    text_loss_weight: float = 1.0,
     semantic_loss_weight: float = 100.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute Moshi-style assistant text and user audio CE losses."""

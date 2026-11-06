@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depformer-layers", type=int, default=6)
     parser.add_argument("--depformer-ffn-dim", type=int, default=4096)
     parser.add_argument("--audio-loss-weight", type=float, default=1.0)
-    parser.add_argument("--text-loss-weight", type=float, default=10.0)
+    parser.add_argument("--text-loss-weight", type=float, default=1.0)
     parser.add_argument("--semantic-loss-weight", type=float, default=100.0)
     parser.add_argument(
         "--text-padding-weight",

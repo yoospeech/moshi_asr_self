@@ -130,7 +130,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --depformer-layers 6 \
   --depformer-ffn-dim 4096 \
   --audio-loss-weight 1.0 \
-  --text-loss-weight 10.0 \
+  --text-loss-weight 1.0 \
   --semantic-loss-weight 100 \
   --text-padding-weight 0.5 \
   --batch-size 2 \
@@ -190,8 +190,8 @@ PAD occupies many frames, so `assistant_all_accuracy` is usually higher. Use
 `assistant_np_accuracy` to judge whether actual continuation tokens improve.
 `--text-padding-weight 0.5` gives each non-PAD target twice the loss weight
 of each PAD target; it changes optimization, not the reported accuracies.
-The total objective is `10 × assistant_text + 1 × audio` with the documented
-`--text-loss-weight 10.0 --audio-loss-weight 1.0` settings.
+The total objective is `assistant_text + audio` with the documented
+`--text-loss-weight 1.0 --audio-loss-weight 1.0` settings.
 
 ```bash
 tensorboard --logdir runs/smollm2_135m_moshi_continuation/tensorboard
