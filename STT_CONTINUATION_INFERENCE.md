@@ -33,7 +33,7 @@ CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 infer_stt_continuation.py \
-  --checkpoint runs/stt_continuation/checkpoint_00100000.pt \
+  --checkpoint runs/stt_continuation_delay1/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --device cuda \
@@ -64,7 +64,7 @@ CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 infer_stt_continuation.py \
-  --checkpoint runs/stt_continuation/checkpoint_00100000.pt \
+  --checkpoint runs/stt_continuation_delay1/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --device cuda \

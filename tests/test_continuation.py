@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from stt_continuation.dataset import DailyTalkDataset, TextAlignmentCollision
 from stt_continuation.model import (
     STTContinuationConfig, SmolLM2MoshiSTTContinuation, masked_multistream_loss,
 )
-from stt_continuation.inference import force_audio_sample_text
+from stt_continuation.inference import force_audio_sample_text, load_config
 
 
 class AlignmentTests(unittest.TestCase):
@@ -68,6 +69,26 @@ class AlignmentTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_inference_rejects_incompatible_delay_pattern(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            base = {
+                "text_context_mode": "independent",
+                "text_delay_seconds": 0.08,
+                "acoustic_delay_steps": 1,
+            }
+            config_path.write_text(json.dumps(base))
+            args = SimpleNamespace(
+                checkpoint=str(Path(directory) / "checkpoint.pt"),
+                config=str(config_path),
+                model=None,
+            )
+            self.assertEqual(load_config(args).delays, [0, 1, 0, 1, 1, 1])
+            base["text_delay_seconds"] = 2.0
+            config_path.write_text(json.dumps(base))
+            with self.assertRaisesRegex(ValueError, "expected"):
+                load_config(args)
+
     def test_inference_training_parity_and_gradients(self):
         torch.manual_seed(7)
         with tempfile.TemporaryDirectory() as directory:

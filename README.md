@@ -193,13 +193,18 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --steps 100000 \
   --learning-rate 2e-4 \
   --temporal-learning-rate 2e-5 \
+  --min-duration 5 \
+  --max-duration 45 \
+  --min-words 5 \
+  --min-words-per-second 0.5 \
+  --max-words-per-second 2.5 \
   --valid-ratio 0.05 \
   --valid-every 500 \
   --valid-batches 20 \
   --log-every 10 \
   --save-every 500 \
   --print-model \
-  --output runs/stt_continuation_independent
+  --output runs/stt_continuation_delay1
 ```
 
 `--batch-size` is per rank: 2 GPUs × batch 2 × accumulation 2 gives an
@@ -232,7 +237,7 @@ CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 infer_stt_continuation.py \
-  --checkpoint runs/stt_continuation/checkpoint_00100000.pt \
+  --checkpoint runs/stt_continuation_delay1/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --tail-seconds 10 \

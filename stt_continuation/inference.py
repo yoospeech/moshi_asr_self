@@ -51,7 +51,14 @@ def load_config(args: argparse.Namespace) -> STTContinuationConfig:
     values = {key: value for key, value in raw.items() if key in names}
     if args.model:
         values["temporal_model"] = args.model
-    return STTContinuationConfig(**values)
+    config = STTContinuationConfig(**values)
+    expected_delays = [0, 1, 0] + [1] * (config.num_codebooks - 1)
+    if config.delays != expected_delays:
+        raise ValueError(
+            "Checkpoint delay pattern is incompatible with delayed user-text "
+            f"inference: expected {expected_delays}, got {config.delays}"
+        )
+    return config
 
 
 def sample_text(logits: torch.Tensor, *, temperature: float, top_k: int, greedy: bool) -> int:
@@ -219,6 +226,13 @@ def main() -> None:
         "audio": str(Path(args.audio)),
         "user_channel": args.user_channel,
         "checkpoint_step": package.get("step"),
+        "stream_order": [
+            "assistant_text",
+            "user_text",
+            "user_semantic",
+            *[f"user_acoustic_{index}" for index in range(1, config.num_codebooks)],
+        ],
+        "delay_pattern": config.delays,
         "decoding": {
             "greedy": args.greedy,
             "temperature": args.text_temperature,
