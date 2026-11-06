@@ -51,9 +51,9 @@ python3 train_stt_continuation.py --smoke-test
 Then train on aligned data:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 train_stt_continuation.py \
+CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
+  --standalone --nproc_per_node=2 train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
-  --mimi-device cuda:1 \
   --num-codebooks 4 \
   --text-delay 2.0 \
   --continuation-delay-steps 1 \
@@ -73,3 +73,23 @@ tensorboard --logdir runs/stt_continuation/tensorboard
 
 The manifest is deterministically split into train and validation sets. The
 exact indices and seed are saved in `OUTPUT/split.json`.
+
+DDP uses one model and one frozen Mimi per GPU. Do not pass `--mimi-device`;
+the local rank selects the device. Batch size is per rank, so the example has
+an effective batch of 8. Steps count microbatches per rank, as in the previous
+trainer; accumulation 2 means one optimizer update every two steps. A final
+partial accumulation group is also applied. Only rank 0 saves unwrapped model
+weights (compatible with the existing inference CLI) and runs validation.
+Training metrics are averaged across ranks; validation uses rank 0's full
+validation loader, limited by `--valid-batches`.
+
+Test DDP before a full run (uses synthetic tokens, without loading Mimi):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
+  --standalone --nproc_per_node=2 train_stt_continuation.py \
+  --model models/SmolLM2-135M --smoke-test --smoke-steps 5 --grad-accum 2 \
+  --output runs/ddp_smoke
+```
+
+The smoke test checks that all ranks finish with identical model parameters.

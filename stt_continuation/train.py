@@ -8,7 +8,10 @@ import json
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, random_split
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 
 from .model import (
@@ -17,6 +20,7 @@ from .model import (
     masked_text_continuation_loss,
 )
 from .dataset import DailyTalkDataset, collate_dailytalk
+from .distributed import TrainingObjective, setup, barrier
 
 from moshi.models import loaders as moshi_loaders
 
@@ -56,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-words-per-second", type=float, default=2.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--smoke-steps", type=int, default=4)
     parser.add_argument("--print-model", action="store_true", help="print the full PyTorch module tree")
     return parser.parse_args()
 
@@ -205,9 +210,23 @@ def evaluate(
 
 
 def main() -> None:
+    try:
+        run_training()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def run_training() -> None:
     args = parse_args()
+    for name in ("batch_size", "grad_accum", "steps", "smoke_steps", "log_every", "save_every", "valid_every"):
+        if getattr(args, name) < 1:
+            raise ValueError(f"{name} must be positive")
+    rank, world_size, device = setup()
+    primary = rank == 0
+    if world_size > 1 and args.mimi_device is not None:
+        raise ValueError("DDP assigns Mimi to each rank's local device; omit --mimi-device")
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -243,7 +262,10 @@ def main() -> None:
         for parameter in mimi.parameters():
             parameter.requires_grad_(False)
 
-    print_model_summary(model, config, mimi, full=args.print_model)
+    if primary:
+        print_model_summary(model, config, mimi, full=args.print_model)
+        print(f"world_size={world_size} effective_batch={world_size * args.batch_size * args.grad_accum}")
+    print(f"rank={rank} training_device={device} mimi_device={device if world_size > 1 else args.mimi_device or device}", flush=True)
 
     tensorboard_dir = Path(args.tensorboard_dir or Path(args.output) / "tensorboard")
     try:
@@ -252,7 +274,17 @@ def main() -> None:
         raise SystemExit(
             "TensorBoard logging requires the 'tensorboard' package: pip install tensorboard"
         ) from error
-    writer = SummaryWriter(log_dir=str(tensorboard_dir))
+    writer = SummaryWriter(log_dir=str(tensorboard_dir)) if primary else None
+
+    objective = TrainingObjective(model, config.text_padding_id)
+    if world_size > 1:
+        # The backbone's own token embedding is bypassed by inputs_embeds.
+        objective = DistributedDataParallel(
+            objective, device_ids=[device.index] if device.type == "cuda" else None,
+            find_unused_parameters=True,
+        )
+    torch.manual_seed(args.seed + rank)
+    train_sampler = None
 
     temporal_parameters = list(model.transformer.parameters())
     temporal_ids = {id(parameter) for parameter in temporal_parameters}
@@ -271,15 +303,15 @@ def main() -> None:
         # audio-conditioned text loss and backward path without a dataset.
         smoke_frames = max(64, max(config.delays) + 8)
         text = torch.randint(
-            0, config.text_card, (1, 2, smoke_frames), device=device
+            0, config.text_card, (args.batch_size, 2, smoke_frames), device=device
         )
         audio = torch.randint(
-            0, args.audio_card, (1, args.num_codebooks, smoke_frames), device=device
+            0, args.audio_card, (args.batch_size, args.num_codebooks, smoke_frames), device=device
         )
         streams = torch.cat([text, audio], dim=1)
         batches = [{"streams": streams}]
         valid_loader = None
-        target_steps = 1
+        target_steps = args.smoke_steps
     else:
         if args.manifest is None:
             raise SystemExit("--manifest is required unless --smoke-test is used")
@@ -313,23 +345,32 @@ def main() -> None:
             generator=split_generator,
         )
         output_dir = Path(args.output)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "split.json").write_text(
-            json.dumps(
-                {
-                    "seed": args.seed,
-                    "valid_ratio": args.valid_ratio,
-                    "train_indices": train_dataset.indices,
-                    "valid_indices": valid_dataset.indices,
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        if primary:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "split.json").write_text(
+                json.dumps(
+                    {
+                        "seed": args.seed,
+                        "valid_ratio": args.valid_ratio,
+                        "train_indices": train_dataset.indices,
+                        "valid_indices": valid_dataset.indices,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        if world_size > 1:
+            if train_size < world_size:
+                raise ValueError("training split must contain at least one sample per rank")
+            train_sampler = DistributedSampler(
+                train_dataset, num_replicas=world_size, rank=rank,
+                seed=args.seed, shuffle=True, drop_last=True,
+            )
         loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             num_workers=2,
             pin_memory=device.type == "cuda",
             collate_fn=collate_dailytalk,
@@ -348,7 +389,10 @@ def main() -> None:
 
     optimizer.zero_grad(set_to_none=True)
     step = 0
+    epoch = 0
     while step < target_steps:
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         for batch in batches:
             if args.smoke_test:
                 streams = batch["streams"].to(device, non_blocking=True)
@@ -360,23 +404,26 @@ def main() -> None:
                 if device.type == "cuda"
                 else contextlib.nullcontext()
             )
-            with autocast:
-                text_logits, text_mask = model.forward_text_training(streams)
-                loss, metrics = masked_text_continuation_loss(
-                    text_logits,
-                    text_mask,
-                    streams,
-                    text_padding_id=config.text_padding_id,
-                )
-                scaled_loss = loss / args.grad_accum
-            scaled_loss.backward()
+            sync = (step + 1) % args.grad_accum == 0 or step + 1 == target_steps
+            accumulation_size = min(args.grad_accum, target_steps - (step // args.grad_accum) * args.grad_accum)
+            sync_context = objective.no_sync() if world_size > 1 and not sync else contextlib.nullcontext()
+            with sync_context:
+                with autocast:
+                    loss, metrics = objective(streams)
+                    scaled_loss = loss / accumulation_size
+                scaled_loss.backward()
 
-            if (step + 1) % args.grad_accum == 0:
+            if sync:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             step += 1
             if step % args.log_every == 0 or step == 1:
+                if world_size > 1:
+                    for value in metrics.values():
+                        dist.all_reduce(value)
+                        value.div_(world_size)
+            if primary and (step % args.log_every == 0 or step == 1):
                 for name, value in metrics.items():
                     writer.add_scalar(name, value.item(), step)
                 writer.add_scalar("optimizer/temporal_lr", optimizer.param_groups[0]["lr"], step)
@@ -389,9 +436,12 @@ def main() -> None:
                     f"cont_np={metrics['continuation/non_pad_accuracy'].item():.3f}",
                     flush=True,
                 )
-            if not args.smoke_test and step % args.save_every == 0:
+            if primary and not args.smoke_test and step % args.save_every == 0:
                 save_checkpoint(model, optimizer, step, Path(args.output))
-            if valid_loader is not None and step % args.valid_every == 0:
+            validate = valid_loader is not None and step % args.valid_every == 0
+            if validate:
+                barrier()
+            if primary and validate:
                 valid_metrics = evaluate(
                     model,
                     valid_loader,
@@ -410,13 +460,26 @@ def main() -> None:
                     f"cont_np={valid_metrics['continuation/non_pad_accuracy']:.3f}",
                     flush=True,
                 )
+            if validate:
+                barrier()
             if step >= target_steps:
                 break
+        epoch += 1
 
-    if not args.smoke_test:
+    barrier()
+    if primary and not args.smoke_test:
         save_checkpoint(model, optimizer, step, Path(args.output))
-    writer.flush()
-    writer.close()
+    if args.smoke_test and world_size > 1:
+        for parameter in model.parameters():
+            reference = parameter.detach().clone()
+            dist.broadcast(reference, src=0)
+            if not torch.equal(reference, parameter):
+                raise RuntimeError("DDP smoke test: model parameters differ across ranks")
+        if primary:
+            print("DDP smoke test: all model parameters synchronized", flush=True)
+    if writer is not None:
+        writer.flush()
+        writer.close()
 
 
 if __name__ == "__main__":

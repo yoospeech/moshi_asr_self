@@ -14,6 +14,7 @@ stt_continuation/
   dataset.py        # user_hyp and assistant alignments, PAD/EPAD
   train.py          # training and validation
   inference.py      # force-fed user audio, two text outputs
+  distributed.py    # DDP process setup and training objective
 scripts/
   transcribe_user_hyp.py
 tests/
@@ -116,14 +117,15 @@ Default filters retain conversations with:
 
 ## Training
 
-For two GPUs, keep the trainable model on visible GPU 0 and frozen Mimi on
-visible GPU 1:
+For DDP on two available GPUs, launch one training process per GPU. Each rank
+loads its own trainable model and frozen Mimi on its local GPU. Omit
+`--mimi-device` in DDP mode:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 train_stt_continuation.py \
+CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
+  --standalone --nproc_per_node=2 train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --model models/SmolLM2-135M \
-  --mimi-device cuda:1 \
   --num-codebooks 4 \
   --text-delay 2.0 \
   --continuation-delay-steps 1 \
@@ -141,8 +143,16 @@ CUDA_VISIBLE_DEVICES=0,1 python3 train_stt_continuation.py \
   --output runs/stt_continuation
 ```
 
-Use `CUDA_VISIBLE_DEVICES=0` with `--mimi-device cuda:0` when running both
-models on one GPU.
+`--batch-size` is per rank: 2 GPUs × batch 2 × accumulation 2 gives an
+effective batch of 8. `--steps` retains its existing meaning of microbatches
+per rank; 100000 steps with accumulation 2 makes 50000 optimizer updates.
+Only rank 0 writes checkpoints/logs and evaluates the validation set; other
+ranks wait during validation. Training shards are shuffled each epoch, with
+at most world_size-1 samples dropped to avoid duplicate examples across ranks.
+
+Use only GPUs allocated to your job in `CUDA_VISIBLE_DEVICES`. For one GPU,
+use `python3 train_stt_continuation.py` without torchrun. The earlier
+single-process model/Mimi split still supports `--mimi-device cuda:1`.
 
 More details are in
 [STT_CONTINUATION_TRAINING.md](STT_CONTINUATION_TRAINING.md).
