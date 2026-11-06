@@ -110,21 +110,46 @@ The output contains the decoded lexical text and every predicted text event:
   },
   "asr_text": "Hello",
   "continuation_text": "Hi",
+  "transcript": {
+    "user_asr": "Hello",
+    "assistant_continuation": "Hi"
+  },
+  "turns": [
+    {
+      "speaker": "user",
+      "channel": "asr",
+      "text": "Hello",
+      "start_time": 2.0,
+      "end_time": 3.2
+    },
+    {
+      "speaker": "assistant",
+      "channel": "continuation",
+      "text": "Hi",
+      "start_time": 0.0,
+      "end_time": 1.2
+    }
+  ],
   "channels": {
     "asr": {
+      "text": "Hello",
       "events": []
     },
     "continuation": {
+      "text": "Hi",
       "events": []
     }
   }
 }
 ```
 
-`channels.asr.events` and `channels.continuation.events` preserve PAD, EPAD,
+Use `transcript.user_asr` and `transcript.assistant_continuation` for the
+readable result. `channels.asr.events` and `channels.continuation.events` preserve PAD, EPAD,
 and lexical predictions for frame-level debugging. Speaker BEGIN/END markers
-and parsed turns are intentionally absent because stream identity carries the
-role: ASR is user text and continuation is assistant inner-monologue text.
+are absent because stream identity carries the role: ASR is user text and
+continuation is assistant inner-monologue text.
+The `turns` array is a readable two-channel view with first/last lexical event
+times; it does not claim to recover multiple dialogue-turn boundaries.
 
 ## Device options
 

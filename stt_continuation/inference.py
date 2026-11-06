@@ -221,16 +221,50 @@ def main() -> None:
         },
         "asr_text": asr_text,
         "continuation_text": continuation_text,
+        "transcript": {
+            "user_asr": asr_text,
+            "assistant_continuation": continuation_text,
+        },
+        "turns": [
+            {
+                "speaker": "user",
+                "channel": "asr",
+                "text": asr_text,
+                "start_time": next(
+                    (event["time"] for event in asr_events if event["token"] not in {"PAD", "EPAD"}),
+                    None,
+                ),
+                "end_time": next(
+                    (event["time"] for event in reversed(asr_events) if event["token"] not in {"PAD", "EPAD"}),
+                    None,
+                ),
+            },
+            {
+                "speaker": "assistant",
+                "channel": "continuation",
+                "text": continuation_text,
+                "start_time": next(
+                    (event["time"] for event in continuation_events if event["token"] not in {"PAD", "EPAD"}),
+                    None,
+                ),
+                "end_time": next(
+                    (event["time"] for event in reversed(continuation_events) if event["token"] not in {"PAD", "EPAD"}),
+                    None,
+                ),
+            },
+        ],
         "channels": {
-            "asr": {"events": asr_events},
-            "continuation": {"events": continuation_events},
+            "asr": {"text": asr_text, "events": asr_events},
+            "continuation": {"text": continuation_text, "events": continuation_events},
         },
     }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"ASR: {asr_text}")
-    print(f"Continuation: {continuation_text}")
+    print("\nUSER ASR")
+    print(asr_text or "(empty)")
+    print("\nASSISTANT CONTINUATION")
+    print(continuation_text or "(empty)")
     print(f"saved {output}")
 
 
