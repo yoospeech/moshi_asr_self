@@ -157,6 +157,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 train_stt_continuation.py \
   --model LiquidAI/LFM3-1.7B \
+  --trust-remote-code \
   --smoke-test \
   --smoke-steps 1 \
   --text-delay 0.08 \
@@ -182,6 +183,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
   train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --model LiquidAI/LFM3-1.7B \
+  --trust-remote-code \
   --num-codebooks 4 \
   --text-delay 0.08 \
   --continuation-delay-steps 0 \
@@ -208,7 +210,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --log-every 10 \
   --save-every 500 \
   --print-model \
-  --output runs/stt_continuation_delay1
+  --output runs/lfm3_1_7b_stt_continuation_delay1
 ```
 
 `--batch-size` is per rank: 2 GPUs × batch 2 × accumulation 2 gives an
@@ -241,7 +243,7 @@ CUDA_VISIBLE_DEVICES=0 \
 PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 infer_stt_continuation.py \
-  --checkpoint runs/stt_continuation_delay1/checkpoint_00100000.pt \
+  --checkpoint runs/lfm3_1_7b_stt_continuation_delay1/checkpoint_00100000.pt \
   --audio /data/db/daily-talk-contiguous/data_stereo/0.wav \
   --user-channel 1 \
   --tail-seconds 10 \

@@ -58,6 +58,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --standalone --nproc_per_node=2 train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --model LiquidAI/LFM3-1.7B \
+  --trust-remote-code \
   --num-codebooks 4 \
   --text-delay 0.08 \
   --continuation-delay-steps 0 \
@@ -71,14 +72,14 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --batch-size 2 \
   --grad-accum 2 \
   --steps 100000 \
-  --output runs/stt_continuation
+  --output runs/lfm3_1_7b_stt_continuation_delay1
 ```
 
 TensorBoard logs include separate user/assistant CE and non-PAD accuracy,
 user-audio Depth losses, validation metrics, and both optimizer learning rates:
 
 ```bash
-tensorboard --logdir runs/stt_continuation/tensorboard
+tensorboard --logdir runs/lfm3_1_7b_stt_continuation_delay1/tensorboard
 ```
 
 The manifest is deterministically split into train and validation sets. The
@@ -98,8 +99,9 @@ Test DDP before a full run (uses synthetic tokens, without loading Mimi):
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --standalone --nproc_per_node=2 train_stt_continuation.py \
-  --model LiquidAI/LFM3-1.7B --smoke-test --smoke-steps 5 --grad-accum 2 \
-  --output runs/ddp_smoke
+  --model LiquidAI/LFM3-1.7B --trust-remote-code \
+  --smoke-test --smoke-steps 5 --grad-accum 2 \
+  --output runs/lfm3_1_7b_ddp_smoke
 ```
 
 The smoke test checks that all ranks finish with identical model parameters.
