@@ -99,9 +99,11 @@ pip install -r requirements.txt
 pip install -e thirdparty/moshi/moshi
 ```
 
-Passing `--model LiquidAI/LFM3-1.7B` downloads the model and tokenizer into the
-Hugging Face cache when they are not already available. LFM3 custom model code
-is trusted automatically. A local model directory can be passed instead. If
+Passing `--model LiquidAI/LFM3-1.7B` downloads the model and tokenizer into
+`models/LFM3-1.7B` when they are not already available. Change the parent
+directory with `--model-download-root`. In DDP, rank 0 downloads the files and
+the other ranks wait before loading them. LFM3 custom model code is trusted
+automatically. A local model directory can be passed instead. If
 `--mimi-checkpoint` is omitted, the Mimi checkpoint is resolved from
 `kyutai/moshiko-pytorch-bf16`.
 
@@ -157,6 +159,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
 /data/util/anaconda3/envs/duplexomni/bin/python \
 train_stt_continuation.py \
   --model LiquidAI/LFM3-1.7B \
+  --model-download-root models \
   --trust-remote-code \
   --smoke-test \
   --smoke-steps 1 \
@@ -183,6 +186,7 @@ PYTHONPATH=thirdparty/moshi/moshi \
   train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --model LiquidAI/LFM3-1.7B \
+  --model-download-root models \
   --trust-remote-code \
   --num-codebooks 4 \
   --text-delay 0.08 \

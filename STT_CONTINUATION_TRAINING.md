@@ -58,6 +58,7 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --standalone --nproc_per_node=2 train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --model LiquidAI/LFM3-1.7B \
+  --model-download-root models \
   --trust-remote-code \
   --num-codebooks 4 \
   --text-delay 0.08 \

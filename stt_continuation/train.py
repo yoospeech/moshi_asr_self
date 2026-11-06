@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from huggingface_hub import snapshot_download
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
@@ -29,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest")
     parser.add_argument("--model", default="models/SmolLM2-135M")
+    parser.add_argument(
+        "--model-download-root",
+        default="models",
+        help="download Hugging Face temporal models under this directory",
+    )
     parser.add_argument(
         "--trust-remote-code",
         action=argparse.BooleanOptionalAction,
@@ -248,19 +254,30 @@ def run_training() -> None:
     torch.manual_seed(args.seed)
     dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
+    model_path = Path(args.model)
+    if not model_path.exists():
+        model_path = Path(args.model_download_root) / args.model.rsplit("/", 1)[-1]
+        if primary:
+            print(f"downloading {args.model} to {model_path}", flush=True)
+            snapshot_download(repo_id=args.model, local_dir=model_path)
+        barrier()
+        if not model_path.exists():
+            raise FileNotFoundError(f"downloaded model directory not found: {model_path}")
+    model_name = str(model_path)
+
     trust_remote_code = (
         args.trust_remote_code
         if args.trust_remote_code is not None
         else "lfm3" in args.model.lower()
     )
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model,
+        model_name,
         trust_remote_code=trust_remote_code,
     )
     base_text_card = len(tokenizer)
     # PAD and EPAD are shared vocabulary rows; timelines and heads are separate.
     config = STTContinuationConfig(
-        temporal_model=args.model,
+        temporal_model=model_name,
         trust_remote_code=trust_remote_code,
         text_card=base_text_card + 2,
         text_padding_id=base_text_card,
