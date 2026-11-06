@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 from dataclasses import fields
 from pathlib import Path
@@ -206,9 +207,20 @@ def main() -> None:
         trust_remote_code=config.trust_remote_code,
     )
     model = SmolLM2MoshiSTTContinuation(config, dtype=dtype, device=device)
-    package = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    print(f"memory-mapping checkpoint {args.checkpoint}", flush=True)
+    package = torch.load(
+        args.checkpoint,
+        map_location="cpu",
+        weights_only=True,
+        mmap=True,
+    )
+    print("loading model weights from checkpoint", flush=True)
     model.load_state_dict(package["model"], strict=True)
+    checkpoint_step = package.get("step")
+    del package
+    gc.collect()
     model.eval()
+    print("model checkpoint loaded", flush=True)
 
     mimi_checkpoint = args.mimi_checkpoint
     if mimi_checkpoint is None:
@@ -239,7 +251,7 @@ def main() -> None:
     payload = {
         "audio": str(Path(args.audio)),
         "user_channel": args.user_channel,
-        "checkpoint_step": package.get("step"),
+        "checkpoint_step": checkpoint_step,
         "stream_order": [
             "assistant_text",
             "user_text",
