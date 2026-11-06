@@ -131,8 +131,16 @@ loads its own trainable model and frozen Mimi on its local GPU. Omit
 `--mimi-device` in DDP mode:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
-  --standalone --nproc_per_node=2 train_stt_continuation.py \
+cd /home/speech/Documents/workspace/moshi_stt_self
+
+CUDA_VISIBLE_DEVICES=0,1 \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+PYTHONPATH=thirdparty/moshi/moshi \
+/data/util/anaconda3/envs/duplexomni/bin/python \
+-m torch.distributed.run \
+  --standalone \
+  --nproc_per_node=2 \
+  train_stt_continuation.py \
   --manifest /data/db/daily-talk-contiguous/dailytalk.user_hyp.jsonl \
   --model models/SmolLM2-135M \
   --num-codebooks 4 \
@@ -149,7 +157,8 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m torch.distributed.run \
   --valid-batches 20 \
   --log-every 10 \
   --save-every 500 \
-  --output runs/stt_continuation
+  --print-model \
+  --output runs/stt_continuation_independent
 ```
 
 `--batch-size` is per rank: 2 GPUs × batch 2 × accumulation 2 gives an
