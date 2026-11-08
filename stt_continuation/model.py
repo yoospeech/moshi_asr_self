@@ -36,7 +36,7 @@ class STTContinuationConfig:
     depformer_heads: int = 16
     depformer_layers: int = 6
     depformer_ffn_dim: int = 4096
-    audio_loss_weight: float = 1.0
+    audio_loss_weight: float = 0.0
     text_loss_weight: float = 1.0
     semantic_loss_weight: float = 100.0
     text_padding_weight: float = 0.5
@@ -216,9 +216,11 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         return asdict(self.stt_continuation_config)
 
     def forward_training(
-        self, streams: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Predict assistant text and user Mimi audio."""
+        self, streams: torch.Tensor, *, predict_audio: bool = True
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None
+    ]:
+        """Predict assistant text and, optionally, user Mimi audio."""
         batch, codebooks, _ = streams.shape
         if codebooks != self.num_codebooks:
             raise ValueError(f"expected {self.num_codebooks} streams, got {codebooks}")
@@ -226,11 +228,14 @@ class SmolLM2MoshiSTTContinuation(LMModel):
         delayed = _delay_sequence(self.delays, streams, initial)
         delayed = torch.cat([initial, delayed], dim=2)
         temporal, text_logits = self.forward_text(delayed[:, :, :-1])
-        audio_logits = self.forward_user_audio_training(delayed[:, :, 1:], temporal)
         text_logits, text_mask = _undelay_sequence(
             self.delays[: self.num_text_streams], text_logits, fill_value=float("nan")
         )
         text_mask &= streams[:, : self.num_text_streams] != self.zero_token_id
+        if not predict_audio:
+            return text_logits, text_mask, None, None
+
+        audio_logits = self.forward_user_audio_training(delayed[:, :, 1:], temporal)
         audio_logits, audio_mask = _undelay_sequence(
             self.delays[self.audio_offset:], audio_logits, fill_value=float("nan")
         )

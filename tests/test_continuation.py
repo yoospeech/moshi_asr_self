@@ -15,7 +15,7 @@ from stt_continuation.model import (
     STTContinuationConfig, SmolLM2MoshiSTTContinuation, masked_multistream_loss,
 )
 from stt_continuation.inference import force_audio_sample_text, load_config
-from stt_continuation.train import resolve_model_source
+from stt_continuation.train import acoustic_prompt_mask, resolve_model_source
 
 
 class AlignmentTests(unittest.TestCase):
@@ -63,6 +63,12 @@ class AlignmentTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_half_batch_is_text_only(self):
+        torch.manual_seed(7)
+        mask = acoustic_prompt_mask(4, 0.5, device="cpu")
+        self.assertEqual(mask.sum().item(), 2)
+        self.assertEqual((~mask).sum().item(), 2)
+
     def test_models_directory_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "models"
@@ -148,6 +154,13 @@ class ModelTests(unittest.TestCase):
                 torch.testing.assert_close(logits[0, 0, t], observed[t][0, 0], atol=1e-5, rtol=1e-5)
             self.assertEqual(audio_logits.shape, (1, 4, streams.shape[-1], 16))
             self.assertTrue(audio_mask[:, :, :8].all())
+            text_logits, text_mask, no_audio_logits, no_audio_mask = (
+                model.forward_training(streams, predict_audio=False)
+            )
+            torch.testing.assert_close(text_logits, logits)
+            torch.testing.assert_close(text_mask, mask)
+            self.assertIsNone(no_audio_logits)
+            self.assertIsNone(no_audio_mask)
             loss, before = masked_multistream_loss(
                 logits, mask, streams, audio_logits=audio_logits, audio_mask=audio_mask,
             )

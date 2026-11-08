@@ -32,6 +32,22 @@ MODEL_REPOSITORIES = {
 }
 
 
+def acoustic_prompt_mask(
+    batch_size: int, text_only_fraction: float, *, device: torch.device | str
+) -> torch.Tensor:
+    """Select acoustic-conditioned and text-only samples within one batch."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if not 0.0 <= text_only_fraction <= 1.0:
+        raise ValueError("text_only_fraction must be between 0 and 1")
+    text_only_count = min(round(batch_size * text_only_fraction), batch_size - 1)
+    mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+    if text_only_count:
+        text_only_indices = torch.randperm(batch_size, device=device)[:text_only_count]
+        mask[text_only_indices] = False
+    return mask
+
+
 def resolve_model_source(model: str, download_root: str) -> tuple[Path, str | None]:
     """Return the local model path and an optional repository to download."""
     requested = Path(model)
@@ -72,6 +88,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mimi-device", help="e.g. cuda:1; defaults to the training device")
     parser.add_argument("--output", default="runs/stt_continuation")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument(
+        "--text-only-fraction", type=float, default=0.5,
+        help="fraction of each training batch with audio removed (default: 0.5)",
+    )
     parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
@@ -88,7 +108,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depformer-heads", type=int, default=16)
     parser.add_argument("--depformer-layers", type=int, default=6)
     parser.add_argument("--depformer-ffn-dim", type=int, default=4096)
-    parser.add_argument("--audio-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--audio-loss-weight", type=float, default=0.0,
+        help="auxiliary user-audio loss weight; 0 keeps audio as conditioning only",
+    )
     parser.add_argument("--text-loss-weight", type=float, default=1.0)
     parser.add_argument("--semantic-loss-weight", type=float, default=100.0)
     parser.add_argument(
@@ -150,7 +173,10 @@ def print_model_summary(
         f"  inputs: text=1 audio={config.num_codebooks} card={config.audio_card} "
         f"delays={config.delays}"
     )
-    print("  objective: assistant text + user audio Depth Transformer")
+    objective = "assistant text"
+    if config.audio_loss_weight > 0:
+        objective += " + user audio Depth Transformer"
+    print(f"  objective: {objective}")
     for name, count in groups.items():
         print(f"  parameters/{name}: {count / 1e6:.2f}M")
     print(f"  parameters/total: {total / 1e6:.2f}M (trainable {trainable / 1e6:.2f}M)")
@@ -174,6 +200,7 @@ def online_streams(
     mimi: torch.nn.Module,
     device: torch.device,
     config: STTContinuationConfig,
+    acoustic_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Extract frozen Mimi codes and combine them with aligned text."""
     continuation_tokens = batch["continuation_tokens"].to(  # type: ignore[union-attr]
@@ -199,6 +226,12 @@ def online_streams(
         dtype=torch.long,
         device=device,
     )
+    if acoustic_mask is None:
+        acoustic_mask = torch.ones(audio_codes.shape[0], dtype=torch.bool, device=device)
+    else:
+        acoustic_mask = acoustic_mask.to(device=device, dtype=torch.bool)
+        if acoustic_mask.shape != (audio_codes.shape[0],):
+            raise ValueError("acoustic_mask must have one boolean value per sample")
     for index, (audio_frames, continuation_frames) in enumerate(
         zip(
             audio_frame_lengths,
@@ -213,7 +246,8 @@ def online_streams(
         streams[
             index, 0, continuation_frames : continuation_frames + tail
         ] = config.text_padding_id
-        streams[index, 1:, :valid_audio_frames] = audio_codes[index, :, :valid_audio_frames]
+        if acoustic_mask[index]:
+            streams[index, 1:, :valid_audio_frames] = audio_codes[index, :, :valid_audio_frames]
     return streams
 
 
@@ -241,7 +275,9 @@ def evaluate(
             else contextlib.nullcontext()
         )
         with autocast:
-            text_logits, text_mask, audio_logits, audio_mask = model.forward_training(streams)
+            text_logits, text_mask, audio_logits, audio_mask = model.forward_training(
+                streams, predict_audio=config.audio_loss_weight > 0
+            )
             _, metrics = masked_multistream_loss(
                 text_logits, text_mask,
                 streams,
@@ -272,6 +308,10 @@ def main() -> None:
 
 def run_training() -> None:
     args = parse_args()
+    if not 0.0 <= args.text_only_fraction <= 1.0:
+        raise ValueError("text-only-fraction must be between 0 and 1")
+    if args.text_only_fraction > 0 and args.batch_size < 2:
+        raise ValueError("batch-size must be at least 2 when mixing text-only samples")
     for name in ("batch_size", "grad_accum", "steps", "smoke_steps", "log_every", "save_every", "valid_every"):
         if getattr(args, name) < 1:
             raise ValueError(f"{name} must be positive")
@@ -486,7 +526,15 @@ def run_training() -> None:
                 streams = batch["streams"].to(device, non_blocking=True)
             else:
                 assert mimi is not None
-                streams = online_streams(batch, mimi, device, config)
+                # Keep a fixed ratio with random positions inside each batch:
+                # by default, batch size 4 means 2 audio-conditioned and 2
+                # text-only examples. Text-only examples retain their text
+                # targets but have no user-audio prompt or audio loss targets.
+                batch_count = batch["waveforms"].shape[0]  # type: ignore[union-attr]
+                acoustic_mask = acoustic_prompt_mask(
+                    batch_count, args.text_only_fraction, device=device
+                )
+                streams = online_streams(batch, mimi, device, config, acoustic_mask)
             autocast = (
                 torch.autocast(device_type="cuda", dtype=dtype)
                 if device.type == "cuda"
@@ -516,10 +564,14 @@ def run_training() -> None:
                     writer.add_scalar(name, value.item(), step)
                 writer.add_scalar("optimizer/temporal_lr", optimizer.param_groups[0]["lr"], step)
                 writer.add_scalar("optimizer/new_modules_lr", optimizer.param_groups[1]["lr"], step)
+                audio_log = (
+                    f"audio={metrics['loss/user_audio'].item():.4f} "
+                    if "loss/user_audio" in metrics else ""
+                )
                 print(
                     f"step={step} loss={metrics['loss/total'].item():.4f} "
                     f"assistant_text={metrics['loss/assistant'].item():.4f} "
-                    f"audio={metrics['loss/user_audio'].item():.4f} "
+                    f"{audio_log}"
                     f"assistant_np_accuracy={metrics['assistant/non_pad_accuracy'].item():.3f} "
                     f"assistant_all_accuracy={metrics['assistant/accuracy'].item():.3f}",
                     flush=True,
@@ -542,11 +594,15 @@ def run_training() -> None:
                 )
                 for name, value in valid_metrics.items():
                     writer.add_scalar(f"valid/{name}", value, step)
+                audio_log = (
+                    f"audio_acc={valid_metrics['user_audio/accuracy']:.3f}"
+                    if "user_audio/accuracy" in valid_metrics else ""
+                )
                 print(
                     f"valid step={step} loss={valid_metrics['loss/total']:.4f} "
                     f"assistant_np_accuracy={valid_metrics['assistant/non_pad_accuracy']:.3f} "
                     f"assistant_all_accuracy={valid_metrics['assistant/accuracy']:.3f} "
-                    f"audio_acc={valid_metrics['user_audio/accuracy']:.3f}",
+                    f"{audio_log}",
                     flush=True,
                 )
             if validate:

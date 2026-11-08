@@ -30,10 +30,18 @@ Assistant word timestamps are converted to the original Moshi PAD/EPAD
 timeline. EPAD is placed immediately before a word unless that would overwrite
 a lexical token. No speaker BEGIN/END tokens are used.
 
-Training jointly optimizes assistant continuation text cross-entropy and user
-semantic/acoustic codebook losses through Moshi's Depth Transformer. Inference
-force-feeds observed user Mimi tokens and samples only assistant text; Depth
-audio predictions are not fed back.
+Training treats user Mimi tokens as an acoustic prompt and optimizes assistant
+continuation text cross-entropy. User semantic/acoustic tokens are not training
+targets by default (`--audio-loss-weight 0`). Inference likewise force-feeds
+observed user Mimi tokens and samples only assistant text.
+
+Each training batch mixes acoustic-conditioned and text-only examples. With
+the documented `--batch-size 4 --text-only-fraction 0.5`, every rank receives
+two examples with the user-audio prompt and two examples with the acoustic
+streams removed. Their positions are sampled randomly in every batch; both
+groups retain the assistant text target. The text-only half is replay from the
+paired assistant-text dataset, not a separate external text corpus, and helps
+keep the pretrained text model active while adapting it to acoustic prompts.
 
 ## Repository layout
 
@@ -53,8 +61,13 @@ tests/test_continuation.py      offline regression tests
 git clone --recurse-submodules https://github.com/yoospeech/moshi_asr_self.git
 cd moshi_asr_self
 pip install -r requirements.txt
-pip install -e thirdparty/moshi/moshi
+pip install --no-deps -e thirdparty/moshi/moshi
 ```
+
+The project uses Transformers 5 tokenizer metadata. Moshi is installed with
+`--no-deps` because its upstream package metadata still caps
+`huggingface-hub` and `safetensors` below the versions used here; the Moshi
+APIs exercised by this project are covered by the smoke and regression tests.
 
 Model paths are standardized under the project `models/` directory:
 
@@ -103,6 +116,7 @@ train_stt_continuation.py \
   --smoke-steps 1 \
   --acoustic-delay 1 \
   --batch-size 1 \
+  --text-only-fraction 0 \
   --output /tmp/moshi_continuation_smoke
 ```
 
@@ -129,11 +143,12 @@ PYTHONPATH=thirdparty/moshi/moshi \
   --depformer-heads 16 \
   --depformer-layers 6 \
   --depformer-ffn-dim 4096 \
-  --audio-loss-weight 1.0 \
+  --audio-loss-weight 0.0 \
   --text-loss-weight 1.0 \
   --semantic-loss-weight 100 \
   --text-padding-weight 0.5 \
-  --batch-size 2 \
+  --batch-size 4 \
+  --text-only-fraction 0.5 \
   --grad-accum 2 \
   --steps 100000 \
   --learning-rate 2e-4 \
@@ -169,8 +184,14 @@ overfitting. LFM3-1.7B is the higher-capacity alternative.
 
 Do not pass `--mimi-device` in DDP; every rank places frozen Mimi and its model
 on the local GPU. Batch size is per rank, so the effective batch above is
-`2 GPUs × batch 2 × accumulation 2 = 8`. `--steps` counts microbatches. Only
+`2 GPUs × batch 4 × accumulation 2 = 16`: 8 acoustic-conditioned and 8
+text-only examples per optimizer update. `--steps` counts microbatches. Only
 rank 0 validates and writes checkpoints.
+
+`--text-only-fraction` is applied independently inside every rank's training
+batch. A value of `0.5` reserves half the samples for text-only replay. At
+least one acoustic-conditioned sample is retained, including in a short final
+batch. Validation remains fully acoustic-conditioned.
 
 For one GPU, run the script directly without `torch.distributed.run`. A separate
 Mimi device can then be selected with `--mimi-device cuda:1`.
@@ -180,18 +201,26 @@ Mimi device can then be selected with `--mimi-device cuda:1`.
 ```text
 loss                    total optimized loss
 assistant_text          assistant continuation cross-entropy
-audio                   weighted mean of user Mimi codebook losses
+audio                   user Mimi codebook loss (only when audio loss weight > 0)
 assistant_np_accuracy   assistant lexical/EPAD accuracy excluding PAD
 assistant_all_accuracy  assistant accuracy including PAD frames
-audio_acc               mean Mimi codebook accuracy (validation)
+audio_acc               mean Mimi codebook accuracy (only when audio loss weight > 0)
 ```
 
 PAD occupies many frames, so `assistant_all_accuracy` is usually higher. Use
 `assistant_np_accuracy` to judge whether actual continuation tokens improve.
 `--text-padding-weight 0.5` gives each non-PAD target twice the loss weight
 of each PAD target; it changes optimization, not the reported accuracies.
-The total objective is `assistant_text + audio` with the documented
-`--text-loss-weight 1.0 --audio-loss-weight 1.0` settings.
+The documented objective is assistant text only:
+
+```text
+loss = 1.0 * assistant_text + 0.0 * audio
+```
+
+The audio streams still condition the acoustic half of each batch; setting
+`--audio-loss-weight 0` removes only the auxiliary user-audio prediction
+objective and skips its Depth/RQ forward pass. `--semantic-loss-weight` has no
+effect while the audio loss weight is zero.
 
 ```bash
 tensorboard --logdir runs/smollm2_135m_moshi_continuation/tensorboard
